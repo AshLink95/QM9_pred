@@ -1,0 +1,25 @@
+[project]
+name = "qm9-pred"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "flax>=0.12.9",
+    "jax>=0.11.1",
+    "optax>=0.2.8",
+    "pyyaml>=6.0.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+notebook = [
+    "ipykernel>=7.3.0",
+    "matplotlib>=3.11.1",
+    "nbconvert>=7.17.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]        # flat package layout: data/, model/, ... import from repo root

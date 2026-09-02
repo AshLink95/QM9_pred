@@ -1,0 +1,27 @@
+# Ablation: energy target alone (CLAUDE.md build-order step 5). Wannier loss switched off.
+
+model:
+  hidden_dim: 128
+  n_layers: 4
+  n_elements: 100
+  rbf:
+    enabled: true
+    n_basis: 16
+    cutoff: 10.0
+
+wannier:
+  max_centers: 64
+  spins: [up, down]
+  width_scale: 1.0
+
+loss:
+  lambda_energy: 1.0
+  lambda_wannier: 0.0        # <- energy-only
+
+train:
+  lr: 1.0e-3
+  batch_size: 32
+  epochs: 300
+  seed: 0
+  val_frac: 0.1
+  test_frac: 0.1

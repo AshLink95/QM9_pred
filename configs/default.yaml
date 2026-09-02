@@ -1,0 +1,27 @@
+# Default experiment config (CLAUDE.md §11 — no magic numbers in code, everything tunable here).
+
+model:
+  hidden_dim: 128          # width of h (invariant scalar track) and the small MLPs
+  n_layers: 4              # EGNN message-passing layers (§4: start 3-4)
+  n_elements: 100          # Z embedding table size (covers all QM9 elements)
+  rbf:                     # optional radial-basis expansion of the edge distance (§4)
+    enabled: true
+    n_basis: 16
+    cutoff: 10.0           # Angstrom; only sets RBF support, NOT a graph cutoff (§3)
+
+wannier:
+  max_centers: 64          # fixed max slots per spin (§6). Set from dataset max after build_dataset.
+  spins: [up, down]
+  width_scale: 1.0         # Gaussian width = width_scale * w_radii (§6: tie to physical radius)
+
+loss:
+  lambda_energy: 1.0
+  lambda_wannier: 1.0
+
+train:
+  lr: 1.0e-3
+  batch_size: 32
+  epochs: 300
+  seed: 0
+  val_frac: 0.1
+  test_frac: 0.1
