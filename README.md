@@ -45,9 +45,11 @@ uv run python main.py                   path/to/fdf_dir/ --params params.msgpack
 ```
 
 `build_dataset` walks each root recursively and pools all molecules into one `dataset.pkl` —
-pass as many roots as you like. Each molecule's `.fdf`/`.out`/`.wout` can live in its own
-subdirectory (siblings of the `.fdf`); `.wout` files supply the converged Wannier targets for
-training.
+pass as many roots as you like. Files are matched by **molecule id** (the filename up to the
+first `.`, e.g. `C2F3N3O_133481`), so the `.fdf`, `.out`, and `.wout` for a molecule may live in
+separate roots (`done/*.fdf`, `out_files/*.out`, `wout_files/*.wout`). `.wout` files supply the
+converged Wannier targets for training; molecules missing an `.out` or a spin `.wout` are
+skipped with a count.
 
 `main.py` predicts from `.fdf` geometry alone (no `.wout` needed — those are training labels).
 A directory reads only its `.fdf` files and writes one JSON array of
