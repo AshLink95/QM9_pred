@@ -10,3 +10,6 @@ CLAUDE.md
 
 # Virtual environments
 .venv
+
+# Notebooks (can't have 'em yet)
+notebooks/*
