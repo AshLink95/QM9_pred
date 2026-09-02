@@ -45,7 +45,7 @@ def build_dataset(data_dir: str | Path, spins: list[str]) -> tuple[list[dict], d
     """Parse all molecules under data_dir. Returns (examples, meta).
     meta['max_centers'] sizes the Wannier head (§6, §9)."""
     data_dir = Path(data_dir)
-    examples = [load_molecule(f, spins) for f in sorted(data_dir.glob("*.fdf"))]
+    examples = [load_molecule(f, spins) for f in sorted(data_dir.rglob("*.fdf"))]
     if not examples:
         raise FileNotFoundError(f"no .fdf molecules found under {data_dir}")
     max_centers = max((max(len(w["radii"]) for w in ex["wannier"]) for ex in examples),

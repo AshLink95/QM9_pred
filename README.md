@@ -37,12 +37,16 @@ never parses files, the loss never builds graphs.
 ## Usage
 
 ```bash
-uv run python -m scripts.build_dataset  path/to/siesta_files  --out dataset.pkl
+uv run python -m scripts.build_dataset  path/to/siesta_files  --out dataset.pkl   # recurses subdirs
 uv run python -m scripts.train          --config configs/default.yaml --dataset dataset.pkl --out params.msgpack
 uv run python -m scripts.evaluate       --dataset dataset.pkl --params params.msgpack
 uv run python main.py                   path/to/molecule.fdf --params params.msgpack   # one molecule → stdout
 uv run python main.py                   path/to/fdf_dir/ --params params.msgpack --out predictions.json  # batch → one .json
 ```
+
+`build_dataset` walks `path/to/siesta_files` recursively (each molecule's `.fdf`/`.out`/`.wout`
+can live in its own subdirectory, siblings of the `.fdf`). `.wout` files supply the converged
+Wannier targets for training.
 
 `main.py` predicts from `.fdf` geometry alone (no `.wout` needed — those are training labels).
 A directory reads only its `.fdf` files and writes one JSON array of
