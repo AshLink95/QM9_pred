@@ -74,7 +74,10 @@ def build_dataset(data_dirs: str | Path | list, spins: list[str]) -> tuple[list[
                 wout_by_spin[spin] = match[0]
         if len(wout_by_spin) < len(spins):
             skipped.append((mid, "missing spin .wout")); continue
-        examples.append(load_molecule(f, outs[mid][0], wout_by_spin, spins))
+        try:
+            examples.append(load_molecule(f, outs[mid][0], wout_by_spin, spins))
+        except Exception as e:                   # malformed/unconverged file -> skip, don't die
+            skipped.append((mid, str(e)))
 
     if not examples:
         raise FileNotFoundError(

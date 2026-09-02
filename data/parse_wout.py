@@ -22,13 +22,13 @@ _WF_RE = re.compile(
 )
 
 
-def _final_state_block(text: str) -> str:
+def _final_state_block(text: str, src="<.wout>") -> str:
     """Slice from the 'Final State' header to the following 'Sum of centres' line.
     Restricting to this block avoids the per-iteration WF lines printed during minimization.
     """
     start = text.rfind("Final State")
     if start == -1:
-        raise ValueError("No 'Final State' section found in .wout")
+        raise ValueError(f"No 'Final State' section found in {src}")
     tail = text[start:]
     end = tail.find("Sum of centres")
     return tail if end == -1 else tail[:end]
@@ -39,7 +39,7 @@ def parse_wout(wout_path: str | Path, spin: str) -> dict[str, np.ndarray]:
         centers[k,3] (Angstrom), radii[k] (Angstrom, = sqrt(spread)), spin[k] (str label).
     """
     text = Path(wout_path).read_text()
-    block = _final_state_block(text)
+    block = _final_state_block(text, src=wout_path)
     rows = _WF_RE.findall(block)
     if not rows:
         raise ValueError(f"No WF centre lines in Final State of {wout_path}")
