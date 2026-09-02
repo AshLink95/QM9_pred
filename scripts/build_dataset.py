@@ -8,7 +8,7 @@ from training.train import load_config
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("data_dir")
+    ap.add_argument("data_dir", nargs="+", help="one or more roots, each searched recursively")
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--out", default="dataset.pkl")
     args = ap.parse_args()

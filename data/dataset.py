@@ -41,13 +41,15 @@ def load_molecule(fdf_path: Path, spins: list[str]) -> dict:
     return {"z": z, "pos": pos, "energy": np.float64(energy), "wannier": wannier}
 
 
-def build_dataset(data_dir: str | Path, spins: list[str]) -> tuple[list[dict], dict]:
-    """Parse all molecules under data_dir. Returns (examples, meta).
+def build_dataset(data_dirs: str | Path | list, spins: list[str]) -> tuple[list[dict], dict]:
+    """Parse all molecules under one or more roots (recursively). Returns (examples, meta).
     meta['max_centers'] sizes the Wannier head (§6, §9)."""
-    data_dir = Path(data_dir)
-    examples = [load_molecule(f, spins) for f in sorted(data_dir.rglob("*.fdf"))]
+    if isinstance(data_dirs, (str, Path)):
+        data_dirs = [data_dirs]
+    fdfs = sorted(f for d in data_dirs for f in Path(d).rglob("*.fdf"))
+    examples = [load_molecule(f, spins) for f in fdfs]
     if not examples:
-        raise FileNotFoundError(f"no .fdf molecules found under {data_dir}")
+        raise FileNotFoundError(f"no .fdf molecules found under {data_dirs}")
     max_centers = max((max(len(w["radii"]) for w in ex["wannier"]) for ex in examples),
                       default=0)
     return examples, {"max_centers": int(max_centers), "spins": spins}
