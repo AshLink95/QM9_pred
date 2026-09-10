@@ -10,7 +10,7 @@ model:
     cutoff: 10.0
 
 wannier:
-  max_centers: 64
+  max_centers: 28          # dataset global max; head still built but its loss is off (below)
   spins: [up, down]
   width_scale: 1.0
 

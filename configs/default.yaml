@@ -10,7 +10,7 @@ model:
     cutoff: 10.0           # Angstrom; only sets RBF support, NOT a graph cutoff (§3)
 
 wannier:
-  max_centers: 64          # fixed max slots per spin (§6). Set from dataset max after build_dataset.
+  max_centers: 28          # dataset global max (build_dataset reported max_centers=28). §6
   spins: [up, down]
   width_scale: 1.0         # Gaussian width = width_scale * w_radii (§6: tie to physical radius)
 
