@@ -17,7 +17,8 @@ def main():
     examples, meta = load_cache(args.dataset)
     # size the Wannier head to the dataset (§6, §9) rather than trusting the config guess
     cfg["wannier"]["max_centers"] = max(cfg["wannier"]["max_centers"], meta["max_centers"])
-    params = train(cfg, examples)
+    # ckpt_path=out: periodic checkpoint each ckpt_every epochs + auto-resume on restart
+    params = train(cfg, examples, ckpt_path=args.out)
     save_params(args.out, params)
     print(f"saved params -> {args.out}")
 

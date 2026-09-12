@@ -22,6 +22,7 @@ train:
   lr: 1.0e-3
   batch_size: 32
   epochs: 300
+  ckpt_every: 5            # checkpoint + val eval every N epochs (survives wall-kill, auto-resumes)
   seed: 0
   val_frac: 0.1
   test_frac: 0.1

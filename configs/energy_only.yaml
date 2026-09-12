@@ -22,6 +22,7 @@ train:
   lr: 1.0e-3
   batch_size: 32
   epochs: 300
+  ckpt_every: 5
   seed: 0
   val_frac: 0.1
   test_frac: 0.1
