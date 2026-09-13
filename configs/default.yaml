@@ -20,7 +20,7 @@ loss:
 
 train:
   lr: 1.0e-3
-  batch_size: 32
+  batch_size: 32           # on GPU raise to 256-512 so the vmap batches fill the device
   epochs: 300
   ckpt_every: 5            # checkpoint + val eval every N epochs (survives wall-kill, auto-resumes)
   seed: 0

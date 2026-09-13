@@ -1,0 +1,28 @@
+# GPU run: same as default.yaml but a big batch so the vmap batches fill the device (§4, §11).
+
+model:
+  hidden_dim: 128
+  n_layers: 4
+  n_elements: 100
+  rbf:
+    enabled: true
+    n_basis: 16
+    cutoff: 10.0
+
+wannier:
+  max_centers: 28
+  spins: [up, down]
+  width_scale: 1.0
+
+loss:
+  lambda_energy: 1.0
+  lambda_wannier: 1.0
+
+train:
+  lr: 1.0e-3
+  batch_size: 256          # GPU-sized; drop if you hit device OOM
+  epochs: 300
+  ckpt_every: 5
+  seed: 0
+  val_frac: 0.1
+  test_frac: 0.1

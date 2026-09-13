@@ -14,6 +14,7 @@ which collapses everything to a handful of fixed shapes: bounded compiles + real
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -107,12 +108,17 @@ def train(cfg, examples, ckpt_path=None):
         cfg["wannier"]["width_scale"]
 
     train_ex, val_ex, _ = split(examples, tc["val_frac"], tc["test_frac"], tc["seed"])
+    # startup diagnostics (flushed): if these don't appear, the hang is env/load, not training
+    print(f"devices: {jax.devices()}", flush=True)
+    print(f"train {len(train_ex)}  val {len(val_ex)}  max_centers {kmax}  "
+          f"batch_size {tc['batch_size']}", flush=True)
+
     model = model_from_config(cfg)
     params = model.init(jax.random.PRNGKey(tc["seed"]),
                         jnp.asarray(train_ex[0]["z"]), jnp.asarray(train_ex[0]["pos"]))
     if ckpt_path and Path(ckpt_path).exists():       # resume after a wall-kill
         params = serialization.from_bytes(params, Path(ckpt_path).read_bytes())
-        print(f"resumed from {ckpt_path}")
+        print(f"resumed from {ckpt_path}", flush=True)
 
     opt = optax.adam(tc["lr"]); opt_state = opt.init(params)
 
@@ -126,6 +132,7 @@ def train(cfg, examples, ckpt_path=None):
     rng = np.random.default_rng(tc["seed"])
     ckpt_every = tc.get("ckpt_every", 10)
     for epoch in range(tc["epochs"]):
+        t0 = time.time()
         losses = []
         for batch in _batches(train_ex, tc["batch_size"], n_spins, kmax, rng):
             batch = {k: jnp.asarray(v) for k, v in batch.items()}
@@ -133,9 +140,11 @@ def train(cfg, examples, ckpt_path=None):
             losses.append(float(loss))
         if epoch % ckpt_every == 0 or epoch == tc["epochs"] - 1:
             mae = _energy_mae_batched(model, params, val_ex, n_spins, kmax, tc["batch_size"])
-            print(f"epoch {epoch:4d}  train loss {np.mean(losses):.4f}  val E-MAE {mae:.4f} eV")
+            print(f"epoch {epoch:4d}  train loss {np.mean(losses):.4f}  "
+                  f"val E-MAE {mae:.4f} eV  ({time.time() - t0:.1f}s)", flush=True)
             if ckpt_path:
                 save_params(ckpt_path, params)       # periodic: survive a wall-kill
+                print(f"checkpoint saved -> {ckpt_path} @ epoch {epoch}", flush=True)
     return params
 
 

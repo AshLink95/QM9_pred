@@ -56,6 +56,34 @@ A directory reads only its `.fdf` files and writes one JSON array of
 `{input, energy, wannier}` records. Energy-only ablation (build-order step 5):
 `--config configs/energy_only.yaml`.
 
+## Training on a cluster (Slurm)
+
+**Never run `uv run` inside a job** — compute nodes have no internet, so `uv` blocks forever
+syncing the venv (a 0-CPU wall-clock timeout). Sync once on the **login node**, then submit a
+job that calls the venv's Python directly:
+
+```bash
+uv sync                       # login node (CPU)
+uv sync --group gpu           # login node, for CUDA (jax[cuda12])
+```
+
+Then from your own sbatch file (where you keep `#SBATCH` specs, module loads, etc.) call one of:
+
+```bash
+bash scripts/train.sh        # CPU: configs/default.yaml
+bash scripts/train-gpu.sh    # GPU: configs/gpu.yaml (batch_size 256); errors out if no GPU visible
+```
+
+Both run `.venv/bin/python -u -m scripts.train` (edit config/dataset/out paths inside). The GPU
+script additionally checks JAX sees a `gpu` device and **fails fast** (instead of silently
+training on CPU) if you forgot `uv sync --group gpu` or landed on a non-GPU node. Do **not**
+`module load cuda` — `jax[cuda12]` bundles its own CUDA libs; you only need the NVIDIA driver
+(`nvidia-smi`). Training prints (unbuffered) the JAX devices at startup (confirm `CudaDevice` on GPU),
+a per-epoch `train loss / val E-MAE / seconds` line, and `checkpoint saved -> params.msgpack @
+epoch N` every `ckpt_every` epochs. Checkpointing is automatic and **resumes** if the `--out` file
+already exists — a wall-kill just means resubmit. On GPU, raise `train.batch_size` (256–512) so
+the batches fill the device.
+
 ## Demo notebooks (`notebooks/`)
 
 Presentation + onboarding; run on a hardcoded methane molecule, no real data required.
