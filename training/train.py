@@ -85,7 +85,12 @@ def _batch_loss(params, model, batch, lam_e, lam_w, ws, n_spins):
             ps = (ws * pr) ** 2 + 1e-6
             ts = (ws * tr) ** 2 + 1e-6
             w = w + jnp.mean(jax.vmap(cloud_l2)(pc, pw, ps, tc, tw, ts))
-    return lam_e * e + lam_w * w
+    return lam_e * e + lam_w * w, (e, w)     # aux: components, for logging / NaN diagnosis
+
+
+def _finite(tree):
+    """True iff every array leaf is free of NaN/inf."""
+    return all(bool(jnp.all(jnp.isfinite(x))) for x in jax.tree_util.tree_leaves(tree))
 
 
 def _energy_mae_batched(model, params, examples, n_spins, kmax, batch_size):
@@ -117,34 +122,54 @@ def train(cfg, examples, ckpt_path=None):
     params = model.init(jax.random.PRNGKey(tc["seed"]),
                         jnp.asarray(train_ex[0]["z"]), jnp.asarray(train_ex[0]["pos"]))
     if ckpt_path and Path(ckpt_path).exists():       # resume after a wall-kill
-        params = serialization.from_bytes(params, Path(ckpt_path).read_bytes())
-        print(f"resumed from {ckpt_path}", flush=True)
+        loaded = serialization.from_bytes(params, Path(ckpt_path).read_bytes())
+        if _finite(loaded):
+            params = loaded
+            print(f"resumed from {ckpt_path}", flush=True)
+        else:                                          # never resume from a diverged run
+            print(f"WARNING: {ckpt_path} contains NaN/inf — ignoring it, starting fresh",
+                  flush=True)
 
     opt = optax.adam(tc["lr"]); opt_state = opt.init(params)
 
     @jax.jit
     def step(params, opt_state, batch):
-        loss, grads = jax.value_and_grad(_batch_loss)(
+        (loss, parts), grads = jax.value_and_grad(_batch_loss, has_aux=True)(
             params, model, batch, lam_e, lam_w, ws, n_spins)
         updates, opt_state = opt.update(grads, opt_state, params)
-        return optax.apply_updates(params, updates), opt_state, loss
+        return optax.apply_updates(params, updates), opt_state, loss, parts, \
+            optax.tree.norm(grads)
 
     rng = np.random.default_rng(tc["seed"])
     ckpt_every = tc.get("ckpt_every", 10)
+    diverged = False
     for epoch in range(tc["epochs"]):
         t0 = time.time()
-        losses = []
-        for batch in _batches(train_ex, tc["batch_size"], n_spins, kmax, rng):
+        losses, e_parts, w_parts = [], [], []
+        for i, batch in enumerate(_batches(train_ex, tc["batch_size"], n_spins, kmax, rng)):
             batch = {k: jnp.asarray(v) for k, v in batch.items()}
-            params, opt_state, loss = step(params, opt_state, batch)
-            losses.append(float(loss))
-        if epoch % ckpt_every == 0 or epoch == tc["epochs"] - 1:
+            prev = params
+            params, opt_state, loss, (e, w), gnorm = step(params, opt_state, batch)
+            if not np.isfinite(float(loss)):
+                # stop at the FIRST bad step: keep the last finite params, report which term broke
+                print(f"NON-FINITE loss at epoch {epoch} step {i}: E-loss {float(e):.3e}  "
+                      f"W-loss {float(w):.3e}  |grad| {float(gnorm):.3e}  "
+                      f"(N atoms {batch['z'].shape[1]}) — stopping, keeping last finite params",
+                      flush=True)
+                params, diverged = prev, True
+                break
+            losses.append(float(loss)); e_parts.append(float(e)); w_parts.append(float(w))
+        last = diverged or epoch == tc["epochs"] - 1
+        if losses and (epoch % ckpt_every == 0 or last):
             mae = _energy_mae_batched(model, params, val_ex, n_spins, kmax, tc["batch_size"])
             print(f"epoch {epoch:4d}  train loss {np.mean(losses):.4f}  "
+                  f"(E {np.mean(e_parts):.4f}  W {np.mean(w_parts):.4f})  "
                   f"val E-MAE {mae:.4f} eV  ({time.time() - t0:.1f}s)", flush=True)
-            if ckpt_path:
-                save_params(ckpt_path, params)       # periodic: survive a wall-kill
-                print(f"checkpoint saved -> {ckpt_path} @ epoch {epoch}", flush=True)
+        if ckpt_path and (epoch % ckpt_every == 0 or last) and _finite(params):
+            save_params(ckpt_path, params)           # periodic: survive a wall-kill
+            print(f"checkpoint saved -> {ckpt_path} @ epoch {epoch}", flush=True)
+        if diverged:
+            break
     return params
 
 
