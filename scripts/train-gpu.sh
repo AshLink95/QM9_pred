@@ -21,5 +21,5 @@ sys.exit(0 if d[0].platform=='gpu' else 1)" || {
 
 .venv/bin/python -u -m scripts.train \
     --config configs/gpu.yaml \
-    --dataset qm9.pkl \
+    --dataset dataset.pkl \
     --out params.msgpack

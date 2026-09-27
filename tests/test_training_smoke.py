@@ -50,3 +50,17 @@ def test_training_reduces_error():
 
     assert np.isfinite(after)
     assert after < before        # the loop actually learns
+
+
+def test_fit_atom_ref_recovers_known_references():
+    from training.train import _fit_atom_ref
+    true = {1: -13.0, 6: -155.0, 8: -430.0}
+    rng = np.random.default_rng(1)
+    ex = []
+    for _ in range(50):
+        z = rng.choice([1, 6, 8], size=int(rng.integers(3, 12)))
+        ex.append({"z": z, "energy": sum(true[int(q)] for q in z)})
+    ref, resid = _fit_atom_ref(ex, n_elements=10)
+    for z, r in true.items():
+        assert abs(ref[z] - r) < 1e-6
+    assert resid < 1e-6 and ref[7] == 0.0          # absent element stays 0

@@ -20,6 +20,7 @@ loss:
 
 train:
   lr: 1.0e-3
+  grad_clip: 1.0            # clip global grad norm (stability safety net)
   batch_size: 256          # GPU-sized; drop if you hit device OOM
   epochs: 300
   ckpt_every: 5

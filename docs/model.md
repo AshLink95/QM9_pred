@@ -99,13 +99,20 @@ that's where permutation symmetry comes from. `h` stays invariant because everyt
 is invariant. The `h +` is a residual connection (helps gradients/stability).
 
 ```python
-w = _mlp([H, 1], "phi_x")(m_ij)                     # [N,N,1] ONE invariant scalar per pair
-x = x + jnp.sum(diff * w, axis=1) / (n - 1 + 1e-9)  # [N,3] equivariant coord update
+w = jnp.tanh(_mlp([H, 1], "phi_x")(m_ij))            # [N,N,1] ONE invariant scalar in (-1,1)
+x = x + jnp.sum(diff / (dist[..., None] + 1.0) * w, axis=1) / (n - 1 + 1e-9)   # [N,3]
 ```
 
 This is the equivariant heart. `φ_x` outputs a **scalar** weight per pair (last dim = 1). The
-update is `x_i += Σ_j (x_i − x_j) · w_ij`: equivariant vectors `diff` scaled by invariant scalars
-`w`, summed. Dividing by `n-1` averages over neighbours so deep stacks don't blow up.
+update is `x_i += Σ_j (x_i − x_j)/(d_ij+1) · w_ij`: equivariant vectors scaled by invariant
+scalars, summed. Dividing by `n-1` averages over neighbours.
+
+**Why the `tanh` and the `/(d+1)` (stabilizer, as in the EGNN reference code):** the plain
+paper form `Σ (x_i−x_j)·φ_x(m_ij)` is unbounded — on the real dataset the coordinate track
+exploded (Wannier loss jumped from ~1e3 to ~1e16 in one epoch, then NaN). `diff/(d+1)` has
+length < 1 and `tanh` bounds the weight to (−1,1), so one layer moves an atom's `x` by at most
+~1 Å. Both factors are invariant scalars, so equivariance is untouched (the tests still pass
+at 1e-8).
 
 `EGNNBackbone` just runs `n_layers` of these in sequence, threading `(h, x)`.
 
@@ -159,6 +166,19 @@ return jnp.sum(per_atom)    # scalar
 Invariant because `h` is invariant. **Sum, not mean**, so energy scales with molecule size the
 way a total energy physically does (add an atom → add its contribution). CLAUDE.md §5.
 
+### Per-element reference energy (in `model.py`)
+```python
+e_ref  = jnp.sum(nn.Embed(n_elements, 1, name="atom_ref")(z))   # sum_i ref[Z_i]
+energy = EnergyHead(h) + e_ref
+```
+SIESTA total energies are ~−1000 to −3000 eV. Starting from a network that outputs ~0, the MSE
+was ~1e12 and training diverged. So each element gets a scalar offset `ref[Z]`, **initialized
+from a least-squares fit** `E ≈ Σ_atoms ref[Z]` on the training set (`training/train.py:
+_fit_atom_ref`); the MLP then only learns the eV-scale residual. It's an ordinary trainable
+param (lives in the checkpoint, so inference needs nothing extra); the `atom_ref` model field
+only sets its *initial* value. Still a sum over atoms → invariant, permutation-invariant,
+size-extensive.
+
 ### WannierHead (equivariant point set per spin)
 ```python
 centroid = jnp.mean(x, axis=0)                       # [3]  equivariant
@@ -202,6 +222,8 @@ reads `configs/*.yaml` and constructs it — no magic numbers in code (CLAUDE.md
 | energy changes under permutation | a non-sum aggregation crept in (e.g. indexing atom 0) | §2, §5 |
 | mirror test fails | you added a chiral feature (triple product / signed volume) | §4 |
 | `NaN` early in training | remove the `+1e-12` in `sqrt`, or radius not passed through `softplus` | §2, §5 |
+| E-loss ~1e12, then NaN | energy offset missing — targets not referenced | §5 per-element reference |
+| W-loss explodes in one epoch | coordinate update unbounded (`tanh` / `/(d+1)` removed) | §2 |
 | centers all collapse to centroid | `A` weights vanish — check `hidden_dim`, learning rate | §5 |
 
 ## Rebuild-by-hand order

@@ -6,7 +6,7 @@ training. Equivariance mechanism (do NOT alter, §4):
 
     m_ij = phi_e(h_i, h_j, radial(||x_i - x_j||))        # invariant message
     h_i  = h_i + phi_h(h_i, sum_j m_ij)                  # invariant scalar update
-    x_i  = x_i + sum_j (x_i - x_j) * phi_x(m_ij)         # equivariant coord update
+    x_i  = x_i + sum_j (x_i - x_j)/(d_ij+1) * tanh(phi_x(m_ij))   # equivariant, bounded
 
 phi_x outputs an INVARIANT scalar weight, so the coord update rotates/translates correctly.
 Vectors are only ever scaled by invariant weights, never mixed frame-dependently.
@@ -66,9 +66,12 @@ class EGNNLayer(nn.Module):
         m_i = jnp.sum(m_ij, axis=1)                     # [N,H]
         h = h + _mlp([H, H], "phi_h")(jnp.concatenate([h, m_i], axis=-1))
 
-        # equivariant coordinate update; phi_x -> invariant scalar weight per pair
-        w = _mlp([H, 1], "phi_x")(m_ij)                 # [N,N,1] invariant
-        x = x + jnp.sum(diff * w, axis=1) / (n - 1 + 1e-9)
+        # equivariant coordinate update; phi_x -> invariant scalar weight per pair.
+        # Stabilized as in the EGNN reference code: unit-ish direction diff/(dist+1) and a
+        # tanh-bounded weight, so one layer moves x by at most ~1 A (unbounded x exploded
+        # in training). Still vector * invariant scalar -> equivariance unchanged.
+        w = jnp.tanh(_mlp([H, 1], "phi_x")(m_ij))       # [N,N,1] invariant, in (-1,1)
+        x = x + jnp.sum(diff / (dist[..., None] + 1.0) * w, axis=1) / (n - 1 + 1e-9)
         return h, x
 
 

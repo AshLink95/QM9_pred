@@ -93,6 +93,20 @@ def _finite(tree):
     return all(bool(jnp.all(jnp.isfinite(x))) for x in jax.tree_util.tree_leaves(tree))
 
 
+def _fit_atom_ref(examples, n_elements):
+    """Least-squares per-element reference energies: E_mol ≈ sum_atoms ref[Z].
+    Returns (ref tuple of length n_elements, residual std in eV). Deterministic statistic of
+    the TRAIN targets — used only to initialize the model's per-element energy offset."""
+    counts = np.zeros((len(examples), n_elements))
+    for i, e in enumerate(examples):
+        np.add.at(counts[i], e["z"], 1)
+    energies = np.array([e["energy"] for e in examples])
+    present = counts.any(axis=0)
+    ref = np.zeros(n_elements)
+    ref[present] = np.linalg.lstsq(counts[:, present], energies, rcond=None)[0]
+    return tuple(float(r) for r in ref), float(np.std(energies - counts @ ref))
+
+
 def _energy_mae_batched(model, params, examples, n_spins, kmax, batch_size):
     """Energy MAE over examples, batched (bucketed) so eval is cheap."""
     errs = []
@@ -118,19 +132,32 @@ def train(cfg, examples, ckpt_path=None):
     print(f"train {len(train_ex)}  val {len(val_ex)}  max_centers {kmax}  "
           f"batch_size {tc['batch_size']}", flush=True)
 
-    model = model_from_config(cfg)
+    atom_ref, resid_std = _fit_atom_ref(train_ex, cfg["model"]["n_elements"])
+    print("atom_ref (eV): " + "  ".join(f"Z{z}={r:.3f}" for z, r in enumerate(atom_ref) if r),
+          flush=True)
+    print(f"energy residual std after ref: {resid_std:.4f} eV  (what the network must learn)",
+          flush=True)
+
+    model = model_from_config(cfg, atom_ref=atom_ref)
     params = model.init(jax.random.PRNGKey(tc["seed"]),
                         jnp.asarray(train_ex[0]["z"]), jnp.asarray(train_ex[0]["pos"]))
     if ckpt_path and Path(ckpt_path).exists():       # resume after a wall-kill
-        loaded = serialization.from_bytes(params, Path(ckpt_path).read_bytes())
-        if _finite(loaded):
+        try:
+            loaded = serialization.from_bytes(params, Path(ckpt_path).read_bytes())
+        except Exception as err:                       # checkpoint from an older architecture
+            loaded = None
+            print(f"WARNING: {ckpt_path} doesn't match this model ({err}) — starting fresh",
+                  flush=True)
+        if loaded is not None and _finite(loaded):
             params = loaded
             print(f"resumed from {ckpt_path}", flush=True)
-        else:                                          # never resume from a diverged run
+        elif loaded is not None:                       # never resume from a diverged run
             print(f"WARNING: {ckpt_path} contains NaN/inf — ignoring it, starting fresh",
                   flush=True)
 
-    opt = optax.adam(tc["lr"]); opt_state = opt.init(params)
+    opt = optax.chain(optax.clip_by_global_norm(tc.get("grad_clip", 1.0)),  # safety net
+                      optax.adam(tc["lr"]))
+    opt_state = opt.init(params)
 
     @jax.jit
     def step(params, opt_state, batch):

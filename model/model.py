@@ -24,6 +24,7 @@ class QM9Model(nn.Module):
     rbf_enabled: bool = True
     n_basis: int = 16
     cutoff: float = 10.0
+    atom_ref: tuple | None = None   # per-element reference energies (eV), init only; see below
 
     @nn.compact
     def __call__(self, z: jnp.ndarray, pos: jnp.ndarray) -> dict:
@@ -31,13 +32,27 @@ class QM9Model(nn.Module):
         x = pos
         h, x = EGNNBackbone(self.hidden_dim, self.n_layers, self.rbf_enabled,
                             self.n_basis, self.cutoff)(h, x)
-        energy = EnergyHead(self.hidden_dim)(h)
+        # E = sum_i ref[Z_i] + sum_i MLP(h_i). The per-element offset absorbs the huge
+        # (~1e3 eV) scale of SIESTA total energies so the network only learns the eV-scale
+        # residual — raw targets made the loss ~1e12 and training diverged. Still a sum over
+        # atoms: invariant, permutation-invariant, size-extensive (CLAUDE.md §5). It is a
+        # normal (trainable) param, so it is saved in checkpoints; `atom_ref` only sets its
+        # initial value at training start (inference loads the trained value).
+        if self.atom_ref is None:
+            ref_init = nn.initializers.zeros
+        else:
+            ref_init = lambda key, shape, dtype=jnp.float32: \
+                jnp.asarray(self.atom_ref, dtype).reshape(shape)
+        e_ref = jnp.sum(nn.Embed(self.n_elements, 1, embedding_init=ref_init,
+                                 name="atom_ref")(z))
+        energy = EnergyHead(self.hidden_dim)(h) + e_ref
         wannier = WannierHead(self.hidden_dim, self.max_centers, self.n_spins)(h, x)
         return {"energy": energy, "wannier": wannier}
 
 
-def model_from_config(cfg: dict) -> QM9Model:
-    """Build QM9Model from a parsed config dict (configs/*.yaml)."""
+def model_from_config(cfg: dict, atom_ref: tuple | None = None) -> QM9Model:
+    """Build QM9Model from a parsed config dict (configs/*.yaml). `atom_ref` (training only)
+    initializes the per-element energy offsets from a fit to the training set."""
     m = cfg["model"]
     return QM9Model(
         hidden_dim=m["hidden_dim"],
@@ -48,4 +63,5 @@ def model_from_config(cfg: dict) -> QM9Model:
         rbf_enabled=m["rbf"]["enabled"],
         n_basis=m["rbf"]["n_basis"],
         cutoff=m["rbf"]["cutoff"],
+        atom_ref=atom_ref,
     )
