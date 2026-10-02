@@ -63,13 +63,14 @@ interface — neither side reaches across.
 - **`configs/`** — YAML hyperparameters (`default.yaml`, `energy_only.yaml`). Code reads these;
   no magic numbers in code (CLAUDE.md §11). `default.yaml` sizes the model, loss weights, lr,
   `max_centers`; `energy_only.yaml` sets `λ_W = 0` for the energy-only ablation.
-- **`scripts/`** — thin CLI wiring only (`build_dataset`, `train`, `evaluate`); run with
+- **`scripts/`** — thin CLI wiring only (`build_dataset`, `train`, `evaluate` = accuracy report, logic in `training/report.py`); run with
   `python -m scripts.<name>`. Logic lives in the packages, not here.
 - **`notebooks/`** — presentation/demos on a hardcoded methane molecule (no data needed): the
   equivariance showcase, pipeline walkthrough, loss visualization, prediction inspection. Shared
   helpers in `notebooks/demo_utils.py`. Nothing importable depends on these (CLAUDE.md §11).
 - **`tests/`** — `test_parsers.py`, `test_equivariance.py` (the gate — see
-  [symmetry](symmetry.md)), `test_loss.py`, `test_training_smoke.py`. Run `uv run pytest -q`.
+  [symmetry](symmetry.md)), `test_loss.py`, `test_training_smoke.py`, `test_metrics.py` +
+  `test_report.py` (accuracy report). Run `uv run pytest -q`.
 
 ## If you rebuild from scratch
 Follow the build order in `../CLAUDE.md §10`; each doc ends with a "Rebuild-by-hand" section for

@@ -115,13 +115,31 @@ Each epoch iterates `_batches`, converts each batch with `jnp.asarray`, and call
 Loading for inference (`main.py`, `scripts/evaluate.py`) builds a template with `model.init`,
 then fills it with `load_params`. The trained `atom_ref` values come from the checkpoint.
 
-## 6. `metrics.py` and `loss.py`
+## 6. Evaluation: `metrics.py`, `report.py`, `loss.py`
 
-- `energy_mae` and `wannier_discrepancy` loop over molecules one at a time. That's fine for
-  evaluation, which isn't differentiated.
-- `loss.py:example_to_jax` converts a parsed NumPy example to JAX arrays for those helpers.
-- Validation MAE during training uses the batched `_energy_mae_batched` in `train.py` instead,
-  because 12k molecules one at a time would be slow.
+None of these are imported by the training loop.
+
+- **`metrics.py:match_wannier`** scores one molecule and spin. Predicted slots with
+  presence > threshold count as centers. They're matched one-to-one to the true centers with
+  `scipy.optimize.linear_sum_assignment` (Hungarian: the pairing with the smallest total
+  distance). It returns per-pair distance (Å) and radius error, plus both counts. Leftovers on
+  either side are missed or extra centers. **`wannier_summary`** aggregates these into center
+  MAE / RMSE / median / p95, radius MAE, and count accuracy.
+  - Why matching is fine here but not as the loss (CLAUDE.md §6): scoring a finished
+    prediction needs no gradient and no padding, so the classic reasons against matching don't
+    apply. The training loss stays the Gaussian cloud.
+- **`report.py`** drives `scripts/evaluate.py`:
+  - `predict_all` is a batched forward pass bucketed by atom count. It returns outputs in input
+    order, and padding each chunk to `batch_size` keeps it to one compiled shape per atom count.
+  - `build_report` produces the per-molecule rows, per-center rows, and the summary.
+    `write_outputs` writes the CSVs, `summary.txt`, and `accuracy.png`.
+  - `load_fresh` parses new folders, reusing `data/dataset.py`'s helpers so molecule ids are
+    kept.
+  - `max_centers_from_checkpoint` reads the slot count from the checkpoint, so the model is
+    always rebuilt with the shapes it was trained with.
+- `energy_mae` (used by the smoke test) loops over molecules one at a time.
+  `loss.py:example_to_jax` converts a parsed NumPy example to JAX arrays for it.
+- Validation MAE during training uses the batched `_energy_mae_batched` in `train.py`.
 
 ---
 

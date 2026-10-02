@@ -39,7 +39,7 @@ never parses files, the loss never builds graphs.
 ```bash
 uv run python -m scripts.build_dataset  root1/ root2/ ...  --out dataset.pkl   # 1+ roots, each recursed
 uv run python -m scripts.train          --config configs/default.yaml --dataset dataset.pkl --out params.msgpack
-uv run python -m scripts.evaluate       --dataset dataset.pkl --params params.msgpack
+uv run python -m scripts.evaluate       --config configs/gpu.yaml --params params.msgpack   # accuracy report (test split)
 uv run python main.py                   path/to/molecule.fdf --params params.msgpack   # one molecule → stdout
 uv run python main.py                   path/to/fdf_dir/ --params params.msgpack --out predictions.json  # batch → one .json
 ```
@@ -83,6 +83,41 @@ a per-epoch `train loss / val E-MAE / seconds` line, and `checkpoint saved -> pa
 epoch N` every `ckpt_every` epochs. Checkpointing is automatic and **resumes** if the `--out` file
 already exists — a wall-kill just means resubmit. On GPU, raise `train.batch_size` (256–512) so
 the batches fill the device.
+
+## Accuracy report (`scripts/evaluate.py`)
+
+Compares the model's predictions with the parsed SIESTA truth for energy and Wannier centers.
+
+```bash
+uv sync --group gpu --group eval     # login node; ALWAYS list every group you use (see below)
+.venv/bin/python -m scripts.evaluate --config configs/gpu.yaml --params params.msgpack
+.venv/bin/python -m scripts.evaluate --config configs/gpu.yaml --params params.msgpack \
+    --data-dir /path/to/fresh_parent            # your own set: recursive .fdf/.out/.wout
+```
+
+- **Default:** the **test split** of `dataset.pkl`: the ~11.8k molecules training never saw.
+  The split is recomputed with the config's seed and fractions, so pass the config the model
+  was trained with, and don't rebuild `dataset.pkl` in between. `--subset val|train|all` scores
+  other parts (e.g. `train` vs `test` shows the memorization gap).
+- **`--data-dir ROOT [ROOT ...]`:** parses a fresh set. Each root is searched recursively and
+  files are matched by molecule id, like `build_dataset`. Incomplete molecules are listed as
+  skipped.
+- **Wannier accuracy:** predicted centers (slots with presence > `--presence-threshold`, default
+  0.5) are Hungarian-matched to the true centers. Reported as center error in Å (MAE / RMSE /
+  median / p95), radius error, and **count accuracy** (predicted count = true count). Matching is
+  evaluation-only; the training loss is still the Gaussian cloud.
+- **Outputs** in `--out-dir` (default `accuracy_report/`):
+  - `summary.txt`: the tables, also printed. Includes a composition-only energy baseline and a
+    rotation-symmetry spot check.
+  - `molecules.csv`: per molecule: formula, true vs predicted energy, per-spin counts and errors.
+  - `centers.csv`: the raw data, one row per center: parsed xyz + radius next to the matched
+    predicted xyz + radius + presence and the distance. `missed` / `extra` rows show
+    unmatched centers.
+  - `accuracy.png`: energy error vs energy, energy error histogram, center-distance histogram
+    per spin, count-error bars, radius parity, per-molecule center error.
+
+⚠ **`uv sync --group X` uninstalls packages from groups you don't list.** `uv sync --group eval`
+alone would remove the CUDA jax. Use `uv sync --group gpu --group eval`.
 
 ## Demo notebooks (`notebooks/`)
 

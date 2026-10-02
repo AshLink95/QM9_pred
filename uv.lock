@@ -1392,6 +1392,10 @@ dependencies = [
 dev = [
     { name = "pytest" },
 ]
+eval = [
+    { name = "matplotlib" },
+    { name = "scipy" },
+]
 gpu = [
     { name = "jax", extra = ["cuda12"] },
 ]
@@ -1411,6 +1415,10 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.1.1" }]
+eval = [
+    { name = "matplotlib", specifier = ">=3.11.1" },
+    { name = "scipy", specifier = ">=1.18.0" },
+]
 gpu = [{ name = "jax", extras = ["cuda12"], specifier = ">=0.11.1" }]
 notebook = [
     { name = "ipykernel", specifier = ">=7.3.0" },
