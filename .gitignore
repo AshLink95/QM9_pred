@@ -13,3 +13,11 @@ CLAUDE.md
 
 # Notebooks (can't have 'em yet)
 notebooks/*
+
+# Training outputs
+runs/
+.jax_cache/
+accuracy_report/
+*.msgpack
+*.best.json
+*.progress.json

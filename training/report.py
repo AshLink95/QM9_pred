@@ -18,6 +18,7 @@ import numpy as np
 from flax import serialization
 
 from data.dataset import _index, _mol_id, load_molecule
+from data.electrons import centers_per_spin
 from symmetry import transforms as T
 from training.metrics import match_wannier, wannier_summary
 
@@ -88,7 +89,7 @@ def predict_all(model, params, examples, batch_size=256):
             w = res["wannier"]
             for j, i in enumerate(chunk):
                 out[i] = {"energy": float(res["energy"][j]), "centers": w["centers"][j],
-                          "radii": w["radii"][j], "presence": w["presence"][j]}
+                          "radii": w["radii"][j]}
     return out
 
 
@@ -108,7 +109,7 @@ def _f(x, nd=6):
     return "" if x is None else round(float(x), nd)
 
 
-def build_report(examples, preds, names, spins, thr, atom_ref=None):
+def build_report(examples, preds, names, spins, atom_ref=None):
     """Compare truth vs prediction. Returns (molecule_rows, center_rows, summary, data) where
     `data` holds the raw arrays the figure is drawn from."""
     mol_rows, center_rows = [], []
@@ -122,9 +123,10 @@ def build_report(examples, preds, names, spins, thr, atom_ref=None):
             e_base.append(float(np.sum(atom_ref[np.asarray(ex["z"])])))
         row = {"molecule": name, "formula": formula(ex["z"]), "n_atoms": len(ex["z"]),
                "E_true_eV": _f(et), "E_pred_eV": _f(ep), "E_err_eV": _f(ep - et)}
+        k = centers_per_spin(ex["z"], len(spins))          # predicted count per spin
         for s, spin in enumerate(spins):
             tc, tr = ex["wannier"][s]["centers"], ex["wannier"][s]["radii"]
-            m = match_wannier(pr["centers"][s], pr["radii"][s], pr["presence"][s], tc, tr, thr)
+            m = match_wannier(pr["centers"][s], pr["radii"][s], k[s], tc, tr)
             by_spin[spin].append(m)
             d = [p[2] for p in m["pairs"]]
             row |= {f"{spin}_n_true": m["n_true"], f"{spin}_n_pred": m["n_pred"],
@@ -146,7 +148,7 @@ def build_report(examples, preds, names, spins, thr, atom_ref=None):
         mol_rows.append(row)
 
     err = np.array(e_pred) - np.array(e_true)
-    summary = {"n_molecules": len(examples), "presence_threshold": thr,
+    summary = {"n_molecules": len(examples),
                "energy": _err_stats(err),
                "energy_baseline": _err_stats(np.array(e_base) - np.array(e_true))
                if e_base else None,
@@ -160,7 +162,7 @@ def build_report(examples, preds, names, spins, thr, atom_ref=None):
 def _center_row(name, spin, status, tc, tr, pr=None, s=None, p=None, dist=None):
     row = {"molecule": name, "spin": spin, "status": status,
            "true_x": "", "true_y": "", "true_z": "", "true_radius": "",
-           "pred_x": "", "pred_y": "", "pred_z": "", "pred_radius": "", "pred_presence": "",
+           "pred_x": "", "pred_y": "", "pred_z": "", "pred_radius": "",
            "dist_A": _f(dist)}
     if tc is not None:
         row |= {"true_x": _f(tc[0]), "true_y": _f(tc[1]), "true_z": _f(tc[2]),
@@ -168,8 +170,7 @@ def _center_row(name, spin, status, tc, tr, pr=None, s=None, p=None, dist=None):
     if pr is not None:
         c = pr["centers"][s][p]
         row |= {"pred_x": _f(c[0]), "pred_y": _f(c[1]), "pred_z": _f(c[2]),
-                "pred_radius": _f(pr["radii"][s][p]),
-                "pred_presence": _f(pr["presence"][s][p], 4)}
+                "pred_radius": _f(pr["radii"][s][p])}
     return row
 
 
@@ -191,8 +192,8 @@ def format_summary(summary, header_lines=()):
         L.append(f"  composition  {b['mae']:10.4f} {b['rmse']:10.4f} {b['median_abs']:12.4f} "
                  f"{b['p95_abs']:10.4f} {b['max_abs']:10.4f} {b['bias']:+9.4f}"
                  "   <- sum of per-element references only (what the network must beat)")
-    L += ["", f"WANNIER CENTERS (Hungarian-matched; predicted = presence > "
-              f"{summary['presence_threshold']})",
+    L += ["", "WANNIER CENTERS per spin (Hungarian-matched; predicted count = valence "
+              "electrons / 2, so 'count acc' checks that rule against the .wout)",
           "  spin   matched  center MAE  RMSE     median   p95      radius MAE  count acc"
           "   count error (pred-true): n"]
     for spin, w in summary["wannier"].items():
@@ -349,3 +350,63 @@ def _figure(path, data, spins):
     fig.tight_layout()
     fig.savefig(path, dpi=130, facecolor=_SURF)
     plt.close(fig)
+
+
+# ------------------------------------------------------------------ one-call evaluation
+def evaluate_checkpoint(cfg, params_path, out_dir, *, examples=None, dataset_path=None,
+                        subset="test", data_dir=None, batch_size=256):
+    """Score a checkpoint and write the report (CSVs, summary.txt, accuracy.png) to `out_dir`.
+
+    Molecules come from `data_dir` (fresh folders, parsed here), else from `examples` (already
+    loaded) or `dataset_path`, restricted to `subset` of the training split (split_seed from
+    cfg). Returns (summary_text, summary_dict). Used by scripts/evaluate.py and the sweep."""
+    import jax                                                    # noqa: F811
+    from data.dataset import load_cache, split
+    from model.model import model_from_config
+    from training.train import load_params, split_seed
+
+    spins = cfg["wannier"]["spins"]
+    cfg = {**cfg, "wannier": {**cfg["wannier"],
+                              "max_centers": max_centers_from_checkpoint(params_path, len(spins))}}
+    header, skipped = [], []
+    if data_dir:
+        examples, skipped = load_fresh(data_dir, spins)
+        names = [e["id"] for e in examples]
+        header.append(f"Fresh set: {', '.join(map(str, data_dir))}  ->  {len(examples)} "
+                      f"molecules parsed, {len(skipped)} skipped")
+    else:
+        if examples is None:
+            examples, _ = load_cache(dataset_path)
+        t = cfg["train"]
+        parts = dict(zip(("train", "val", "test"),
+                         split(list(range(len(examples))), t["val_frac"], t["test_frac"],
+                               split_seed(t))))
+        idx = range(len(examples)) if subset == "all" else parts[subset]
+        names = [f"pkl#{i}" for i in idx]
+        examples = [examples[i] for i in idx]
+        header.append(f"{dataset_path or 'dataset'}: subset '{subset}'  ->  {len(examples)} "
+                      f"molecules")
+    if not examples:
+        raise SystemExit("no molecules to evaluate")
+
+    model = model_from_config(cfg)
+    template = model.init(jax.random.PRNGKey(0), np.asarray(examples[0]["z"]),
+                          np.asarray(examples[0]["pos"]))
+    try:
+        params = load_params(params_path, template)
+    except Exception as err:
+        raise SystemExit(f"{params_path} doesn't match the config ({err}). "
+                         "Use the config the model was trained with.")
+
+    preds = predict_all(model, params, examples, batch_size)
+    ref = params["params"].get("atom_ref", {}).get("embedding")
+    atom_ref = None if ref is None else np.asarray(ref)[:, 0]
+    mol_rows, center_rows, summary, data = build_report(examples, preds, names, spins, atom_ref)
+    de, dc = rotation_drift(model, params, examples[0])
+    text = format_summary(summary, [f"Accuracy report — model {params_path}"] + header) + (
+        f"\n\nSYMMETRY spot-check (random rotation, one molecule): energy drift {de:.2e} eV, "
+        f"center drift {dc:.2e} A")
+    if skipped:
+        text += "\n\nSKIPPED (first 20):\n" + "\n".join(f"  {m}: {why}" for m, why in skipped[:20])
+    write_outputs(out_dir, mol_rows, center_rows, text, data, spins)
+    return text, summary

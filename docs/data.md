@@ -6,7 +6,11 @@ nothing here is learned.** This directory is the boundary: it hands the model an
 graph, and the model never reaches back to parse files. Mostly plain `numpy`
 ([primer §1](jax_flax_primer.md) on why `np` here, `jnp` in the model).
 
-Files: `units.py`, `parse_siesta.py`, `parse_wout.py`, `graph.py`, `dataset.py`.
+Files: `units.py`, `parse_siesta.py`, `parse_wout.py`, `graph.py`, `dataset.py`,
+`electrons.py`.
+
+New to the physics (what a `.fdf`, a total energy, or a Wannier center is)? Read
+[physics_primer](physics_primer.md) first.
 
 ---
 
@@ -69,8 +73,8 @@ _WF_RE = re.compile(r"WF centre and spread\s+\d+\s+\(\s*(-?\d+\.\d+)\s*,\s*(-?\d
 ```
 Each match yields `(x, y, z, spread)`. Then:
 - `centers = arr[:, :3]` (Å),
-- `radii = sqrt(spread)` — the spread is `⟨r²⟩−⟨r⟩²` in Å², so its square root is a length; this
-  is the per-center "size" that [losses](losses.md) uses as the Gaussian width,
+- `radii = sqrt(spread)` — the spread is `⟨r²⟩−⟨r⟩²` in Å², so its square root is a length: the
+  per-center "size" the model learns to predict ([losses](losses.md) §3b),
 - `spin` = the label you pass in (`"up"`/`"down"`), determined by **which file** (`*.up.wout` vs
   `*.down.wout`), not by anything inside the file.
 
@@ -100,15 +104,40 @@ training.
 
 ## 5. `dataset.py` — molecules → examples, split, cache
 
-- `load_molecule(fdf_path, spins)`: parses one molecule; finds its siblings by **filename stem**
-  glob (`{stem}*.out`, `{stem}*{spin}*.wout`). Returns
-  `{z, pos, energy, wannier=[{centers,radii} per spin]}`, the `wannier` list ordered to match
-  `config wannier.spins`.
-- `build_dataset(dir, spins)`: parses all `*.fdf`; computes `meta["max_centers"] =` the largest
-  per-spin center count in the set — this **sizes the Wannier head** (`M`) so every molecule fits
-  (CLAUDE.md §6, §9).
-- `split(examples, val_frac, test_frac, seed)`: deterministic permutation → train/val/test.
-- `save_cache`/`load_cache`: pickle the parsed examples + meta so you parse once.
+On the cluster the three file types live in **separate folders**, e.g.
+`done/C2F3N3O_133481.fdf`, `out_files/C2F3N3O_133481.out`,
+`wout_files/C2F3N3O_133481.manifold.valence.up.wout` (and `.down.wout`). Files are matched by
+**molecule id**: the filename up to the first `.` (here `C2F3N3O_133481`).
+
+- `_mol_id(path)`: the id (`path.name.split(".", 1)[0]`).
+- `_index(dirs, ext)`: walks every root **recursively** (`rglob`) and maps id → list of files
+  with that extension. Built once for `.out` and once for `.wout`.
+- `load_molecule(fdf_path, out_path, wout_by_spin, spins)`: parses one molecule from
+  already-found paths. Returns `{z, pos, energy, wannier=[{centers, radii} per spin]}`, with the
+  `wannier` list ordered like config `wannier.spins` (`[up, down]`).
+- `build_dataset(dirs, spins)`: accepts one or many roots. For every `.fdf` it finds the `.out`
+  and one `.wout` per spin (the spin name must appear in the filename). Molecules missing a file,
+  or whose `.wout` has no `Final State` (an unconverged Wannier run), are **skipped and counted**
+  instead of stopping the build. It also computes `meta["max_centers"]` (the largest per-spin
+  count), which sizes the Wannier head.
+- `split(examples, val_frac, test_frac, seed)`: a fixed shuffle (seed 0) cut into train / val /
+  test, 80 / 10 / 10 by default. Same input list + same seed ⇒ same split, which is how
+  `scripts/evaluate.py` finds the exact test molecules again
+  ([ml_primer](ml_primer.md) explains why there are three groups).
+- `save_cache` / `load_cache`: pickle the parsed examples + meta into `dataset.pkl`, so the slow
+  parsing happens once.
+
+## 6. `electrons.py` — how many Wannier centers each spin has
+
+```python
+VALENCE = {1: 1, 6: 4, 7: 5, 8: 6, 9: 7}         # H, C, N, O, F
+centers_per_spin(z, n_spins)  ->  [Σ VALENCE[z] / 2] * n_spins
+```
+Each spin channel of a closed-shell molecule has (valence electrons) / 2 Wannier centers
+([physics_primer](physics_primer.md) §5). This matched the parsed `.wout` count for 100% of the
+dataset, so the count is **computed, never learned**. Training, the report, and `main.py` all use
+this function. It raises on an element missing from `VALENCE` (add it; the value must match the
+SIESTA pseudopotential) or on an odd electron count (an open-shell molecule, not supported).
 
 ---
 
@@ -119,7 +148,9 @@ training.
 | energy looks wrong / not converged | grabbed a non-final `siesta: Total` | must be `findall(...)[-1]`; §2 |
 | way too many / garbage centers | matched per-iteration WF lines, not Final State | `_final_state_block` slicing; §3 |
 | wrong element identities | `ChemicalSpeciesLabel` species index misread | `_species_to_z`; §2 |
-| `FileNotFoundError` on `.wout` | the stem-glob assumption doesn't match real filenames | adjust the globs in `load_molecule`; **this is the one thing to confirm when real data lands** |
+| many molecules "skipped … no .out / missing spin .wout" | filenames don't share the molecule id, or the spin name isn't in the `.wout` filename | check `_mol_id` against real names; §5 |
+| skipped with "No 'Final State' section found in …" | that Wannier90 run didn't converge | expected for a few hundred molecules; they're excluded |
+| `ValueError: no valence charge for element(s)` | an element not in `VALENCE` | add it to `electrons.py`; §6 |
 | head too small at train | `max_centers` in config < dataset max | `scripts/train.py` raises it to `meta["max_centers"]` |
 
 ## Rebuild-by-hand order
@@ -128,4 +159,5 @@ training.
    `parse_fdf`; `parse_energy` (last-match regex). Verify against a real `.fdf`/`.out` by hand.
 3. `parse_wout` (Final-State slice + WF regex + `sqrt(spread)`).
 4. `graph.build_graph` (meshgrid edges, rel-vec, distances).
-5. `dataset` (stem matching, `max_centers`, split, cache). Then feed [model](model.md).
+5. `dataset` (id index across roots, skip-and-count, `max_centers`, split, cache).
+6. `electrons.centers_per_spin` (valence table). Then feed [model](model.md).

@@ -2,7 +2,9 @@
 
 EnergyHead    -- invariant scalar, sum of per-atom readouts (size-extensive).
 WannierHead   -- equivariant point set per spin channel: fixed max_centers slots, each with
-                 a center (equivariant), radius (invariant, >0) and presence (invariant, 0..1).
+                 a center (equivariant) and a radius (invariant, >0). How many slots are real
+                 is NOT predicted: it's Σ valence/2 per spin (data/electrons.py), and the first
+                 k slots of each spin are the predicted centers.
 
 Equivariance of the centers (§5: must come from the equivariant track, never a raw MLP):
 
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import flax.linen as nn
 import jax.numpy as jnp
+import numpy as np
 
 
 class EnergyHead(nn.Module):
@@ -36,6 +39,7 @@ class WannierHead(nn.Module):
     hidden_dim: int
     max_centers: int
     n_spins: int                                     # len(config spins), e.g. up/down -> 2
+    radius_init: float | None = None                 # data mean radius (Å), init only
 
     @nn.compact
     def __call__(self, h: jnp.ndarray, x: jnp.ndarray) -> dict[str, jnp.ndarray]:
@@ -52,12 +56,16 @@ class WannierHead(nn.Module):
         offsets = jnp.einsum("nsm,nd->smd", A, x - centroid)   # [S,M,3]
         centers = centroid[None, None, :] + offsets   # [S,M,3] equivariant
 
-        # invariant per-slot radius (>0) and presence (0..1), size-extensive sum over atoms
-        rp = jnp.sum(nn.Sequential([
+        # invariant per-slot radius (>0). MEAN over atoms (a center's size doesn't grow with the
+        # molecule, unlike energy), plus a learned offset that starts at the dataset's mean
+        # radius so training begins at the "constant guess" error instead of far from it.
+        rp = jnp.mean(nn.Sequential([
             nn.Dense(self.hidden_dim, name="rp0"), nn.silu,
-            nn.Dense(S * M * 2, name="rp1"),
-        ])(h), axis=0).reshape(S, M, 2)               # [S,M,2]
-        radii = nn.softplus(rp[..., 0])               # [S,M] >0
-        presence = nn.sigmoid(rp[..., 1])             # [S,M] in (0,1)
+            nn.Dense(S * M, name="rp1"),
+        ])(h), axis=0).reshape(S, M)                  # [S,M]
+        r0 = 0.0 if self.radius_init is None else \
+            float(np.log(np.expm1(self.radius_init)))      # softplus^-1(mean radius)
+        offset = self.param("radius_offset", lambda key: jnp.asarray(r0, jnp.float32))
+        radii = nn.softplus(rp + offset)              # [S,M] >0
 
-        return {"centers": centers, "radii": radii, "presence": presence}
+        return {"centers": centers, "radii": radii}

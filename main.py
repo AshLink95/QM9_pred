@@ -15,6 +15,7 @@ from pathlib import Path
 import jax
 import numpy as np
 
+from data.electrons import centers_per_spin
 from data.parse_siesta import parse_fdf
 from model.model import model_from_config
 from training.train import load_config, load_params
@@ -28,21 +29,15 @@ def load_model(cfg, params_path, z0, pos0):
     return model, load_params(params_path, template)
 
 
-def record_for(name, out, spins):
-    """One JSON record: {input, energy, wannier:{spin:[{position,radius,presence}, ...]}}.
-    Keeps only slots the model considers real (presence > 0.5), same gate as the stdout view."""
+def record_for(name, out, spins, z):
+    """One JSON record: {input, energy, wannier:{spin:[{position, radius}, ...]}}.
+    Each spin's centers are its first k slots, k = valence electrons / 2 (data/electrons.py)."""
     centers = np.asarray(out["wannier"]["centers"])
     radii = np.asarray(out["wannier"]["radii"])
-    presence = np.asarray(out["wannier"]["presence"])
-    wannier = {}
-    for s, spin in enumerate(spins):
-        keep = np.where(presence[s] > 0.5)[0]
-        wannier[spin] = [
-            {"position": [round(float(v), 6) for v in centers[s, k]],
-             "radius": round(float(radii[s, k]), 6),
-             "presence": round(float(presence[s, k]), 6)}
-            for k in keep
-        ]
+    k = centers_per_spin(z, len(spins))
+    wannier = {spin: [{"position": [round(float(v), 6) for v in centers[s, j]],
+                       "radius": round(float(radii[s, j]), 6)} for j in range(k[s])]
+               for s, spin in enumerate(spins)}
     return {"input": name, "energy": round(float(out["energy"]), 6), "wannier": wannier}
 
 
@@ -73,7 +68,7 @@ def run_directory(input_dir, cfg, out_path, params_path):
     if mols:
         model, params = load_model(cfg, params_path, mols[0][1], mols[0][2])
         for name, z, pos in mols:
-            records.append(record_for(name, model.apply(params, z, pos), spins))
+            records.append(record_for(name, model.apply(params, z, pos), spins, z))
     records.extend({"input": name, "error": err} for name, err in errors.items())
     records.sort(key=lambda r: r["input"])
 
@@ -92,12 +87,13 @@ def run_single(fdf_path, cfg, params_path):
 
     print(f"energy = {float(out['energy']):.4f} eV")
     centers = np.asarray(out["wannier"]["centers"])
-    presence = np.asarray(out["wannier"]["presence"])
-    for s, spin in enumerate(cfg["wannier"]["spins"]):
-        keep = presence[s] > 0.5
-        print(f"[{spin}] {int(keep.sum())} centers (of {centers.shape[1]} slots)")
-        for c in centers[s][keep]:
-            print(f"    {c[0]:8.4f} {c[1]:8.4f} {c[2]:8.4f}")
+    radii = np.asarray(out["wannier"]["radii"])
+    spins = cfg["wannier"]["spins"]
+    k = centers_per_spin(z, len(spins))
+    for s, spin in enumerate(spins):
+        print(f"[{spin}] {k[s]} centers  (x y z  radius, Angstrom)")
+        for c, r in zip(centers[s][:k[s]], radii[s][:k[s]]):
+            print(f"    {c[0]:8.4f} {c[1]:8.4f} {c[2]:8.4f}   {r:.4f}")
 
 
 def build_argparser():

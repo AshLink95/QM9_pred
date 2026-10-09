@@ -52,8 +52,9 @@ jax.tree_util.tree_map(lambda x: x / n, grads)          # divide every gradient 
 jax.tree_util.tree_map(lambda a, b: a + b, gA, gB)      # add two gradient trees leafwise
 ```
 
-`training/train.py` uses exactly these two to average per-example gradients. Mental model:
-`tree_map` is `map()` over the leaves of a nested dict, preserving the structure.
+Mental model: `tree_map` is `map()` over the leaves of a nested dict, preserving the
+structure. In this repo, `training/train.py:_finite` walks the leaves (`tree_leaves`) to check
+for NaN, and optax applies updates leafwise the same way.
 
 ## 4. Flax modules — `nn.Module`, `@nn.compact`, and the layer primitives
 
@@ -80,8 +81,9 @@ class EnergyHead(nn.Module):
   - `nn.Embed(num, dim)` — a lookup table mapping integer `Z` → a `dim`-vector (see
     [model](model.md), `ElementEmbedding`).
   - `nn.silu` — the SiLU/swish activation `x·sigmoid(x)`; used as a plain function.
-  - `nn.softplus`, `nn.sigmoid` — smooth maps to `(0,∞)` and `(0,1)`, used to keep radii
-    positive and presence in a probability range.
+  - `nn.softplus` — smooth map to `(0,∞)`, used to keep predicted radii positive.
+  - `self.param(name, init_fn)` — declares a single trainable array by hand (used for the
+    radius offset in `WannierHead`, which starts at the dataset's mean radius).
   - `nn.Sequential([layer, fn, layer, ...])` — chains callables; this repo's `_mlp` helper
     builds these (see [model](model.md)).
 
@@ -117,9 +119,41 @@ This split is the whole reason JAX can `grad` the network: `apply` is a plain fu
 - **`jax.value_and_grad(f)`** returns `(f(x), grad)` in one pass — you usually want the loss
   value *and* its gradient. With `has_aux=True`, `f` returns `(scalar, aux)` and you get
   `((scalar, aux), grad)` (the loss code returns `(total, {"energy":..., "wannier":...})`).
-- **`jax.vmap(f)`** auto-vectorizes `f` over a new batch axis. Not used in training here (we loop
-  over molecules because their shapes differ) but it's the standard way to batch equal-shaped
-  inputs, and it's how you'd batch if you padded molecules to a common size.
+- **`jax.vmap(f)`** auto-vectorizes `f` over a new batch axis. Training uses it on every step:
+  `jax.vmap(lambda z, p: model.apply(params, z, p))` runs a whole batch of same-size molecules at
+  once ([training](training.md) §1–2). Batches are grouped by atom count so shapes match.
+- **`jax.lax.stop_gradient(x)`** returns `x` unchanged but tells `grad` not to differentiate
+  through it. The Wannier loss uses it on the pairing (`perm`): the pairing is a discrete choice,
+  and only the chosen pairs' distances are differentiated ([losses](losses.md) §3a).
+- **Asynchronous dispatch:** calling a jitted function returns immediately with a placeholder
+  array; the GPU runs the work in the background, in call order. Python only waits when it needs
+  a value on the host (`float(x)`, `np.asarray(x)`, `jax.device_get(x)`). The training loop relies
+  on this to let the CPU compute the next pairing while the GPU trains ([training](training.md) §3),
+  and it fetches losses once per epoch instead of every step.
+- (`jax.pure_callback` calls NumPy/SciPy from *inside* a jitted function. An earlier version ran
+  the Hungarian pairing that way; it was moved out because the GPU sat idle during each call.)
+
+### Sharding: one program over several devices
+```python
+from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
+mesh = jax.make_mesh((n_devices,), ("data",), axis_types=(AxisType.Auto,))
+data_sh = NamedSharding(mesh, P("data"))   # first axis split across the "data" devices
+repl    = NamedSharding(mesh, P())         # a full copy on every device
+x = jax.device_put(batch_array, data_sh)   # each device now holds 1/n of the batch
+```
+- A **mesh** names the devices along an axis ("data"). A **sharding** says how an array is laid
+  out on that mesh: split (`P("data")`) or replicated (`P()`).
+- `jax.jit` looks at the shardings of its inputs and splits the computation to match, inserting
+  communication (e.g. summing gradients across devices) where needed. `out_shardings=` fixes how
+  outputs are laid out.
+- `AxisType.Auto` lets the compiler choose the shardings of intermediate values. This JAX version
+  defaults to `Explicit`, where every ambiguous operation must be annotated (it raises
+  `ShardingTypeError` otherwise).
+
+### Persistent compilation cache
+Setting the environment variable `JAX_COMPILATION_CACHE_DIR=<folder>` makes JAX save compiled
+programs to disk and reuse them in later processes with the same shapes and devices. The repo's
+launchers point it at `.jax_cache/`, so the first-epoch compilation is done once.
 
 ## 7. `optax` — the optimizer as three pure functions
 
@@ -134,6 +168,16 @@ params = optax.apply_updates(params, updates)           # params + updates, leaf
 
 `updates` and `params` are pytrees of the same shape; `apply_updates` is a `tree_map` add under
 the hood. See the loop in [training](training.md).
+
+**Schedules:** `lr` can be a function of the step number instead of a number:
+```python
+sched = optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3,
+                                           warmup_steps=w, decay_steps=total, end_value=1e-5)
+opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(sched))
+sched(0), sched(w), sched(total)          # 0.0, 1e-3, 1e-5
+```
+`optax.chain` applies transforms in order (clip the gradient, then Adam). The step counter lives in
+`opt_state`, so saving and restoring the optimizer state also restores the schedule position.
 
 ## 8. `flax.serialization` — saving weights
 

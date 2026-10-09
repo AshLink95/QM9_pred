@@ -12,10 +12,12 @@ from model.model import model_from_config
 from training import report as R
 from training.train import save_params
 
+from tests._fake import WANNIER_CFG, molecules
+
 CFG = {
     "model": {"hidden_dim": 16, "n_layers": 2, "n_elements": 10,
               "rbf": {"enabled": True, "n_basis": 8, "cutoff": 10.0}},
-    "wannier": {"max_centers": 4, "spins": ["up", "down"], "width_scale": 1.0},
+    "wannier": WANNIER_CFG,
     "loss": {"lambda_energy": 1.0, "lambda_wannier": 1.0},
     "train": {"lr": 1e-3, "batch_size": 4, "epochs": 1, "seed": 0,
               "val_frac": 0.25, "test_frac": 0.25},
@@ -23,16 +25,7 @@ CFG = {
 
 
 def _examples(n=9, seed=0):
-    rng = np.random.default_rng(seed)
-    out = []
-    for _ in range(n):
-        na, k = int(rng.integers(3, 6)), int(rng.integers(1, 4))
-        out.append({"z": rng.choice([1, 6, 8], na).astype(np.int32),
-                    "pos": rng.standard_normal((na, 3)) * 1.5,
-                    "energy": np.float64(rng.uniform(-300, -50)),
-                    "wannier": [{"centers": rng.standard_normal((k, 3)),
-                                 "radii": rng.uniform(.5, 1, k)} for _ in range(2)]})
-    return out
+    return molecules(n, seed)
 
 
 def _model_params(ex):
@@ -53,7 +46,7 @@ def test_report_outputs(tmp_path):
     model, params = _model_params(ex)
     preds = R.predict_all(model, params, ex, batch_size=4)
     mol, cen, summary, data = R.build_report(ex, preds, [f"m{i}" for i in range(len(ex))],
-                                             ["up", "down"], thr=0.5)
+                                             ["up", "down"])
     R.write_outputs(tmp_path, mol, cen, R.format_summary(summary), data, ["up", "down"])
     for f in ("molecules.csv", "centers.csv", "summary.txt", "accuracy.png"):
         assert (tmp_path / f).stat().st_size > 0
@@ -98,11 +91,11 @@ def test_load_fresh_recursive_three_roots(tmp_path):
 
 def test_cli_default_test_split(tmp_path, monkeypatch, capsys):
     ex = _examples(12)
-    save_cache(tmp_path / "ds.pkl", ex, {"max_centers": 4, "spins": ["up", "down"]})
+    save_cache(tmp_path / "ds.pkl", ex, {"max_centers": 10, "spins": ["up", "down"]})
     (tmp_path / "cfg.yaml").write_text(yaml.safe_dump(CFG))
     _, params = _model_params(ex)
     save_params(tmp_path / "p.msgpack", params)
-    assert R.max_centers_from_checkpoint(tmp_path / "p.msgpack", 2) == 4
+    assert R.max_centers_from_checkpoint(tmp_path / "p.msgpack", 2) == 10
 
     from scripts import evaluate
     monkeypatch.setattr(sys, "argv", [

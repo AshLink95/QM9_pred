@@ -12,15 +12,18 @@ from model.model import model_from_config
 from training.train import load_config, save_params
 
 FDF = """\
-NumberOfAtoms 2
+NumberOfAtoms 5
 %block ChemicalSpeciesLabel
  1 6 C
  2 1 H
 %endblock ChemicalSpeciesLabel
 AtomicCoordinatesFormat Ang
 %block AtomicCoordinatesAndAtomicSpecies
- 0.0 0.0 0.0 1
- 0.0 0.0 1.1 2
+ 0.000  0.000  0.000 1
+ 0.629  0.629  0.629 2
+ 0.629 -0.629 -0.629 2
+-0.629  0.629 -0.629 2
+-0.629 -0.629  0.629 2
 %endblock AtomicCoordinatesAndAtomicSpecies
 """
 
@@ -50,6 +53,6 @@ def test_run_directory_ignores_non_fdf_and_writes_json(tmp_path):
         assert set(r["wannier"]) == set(cfg["wannier"]["spins"])
         for spin_centers in r["wannier"].values():
             for c in spin_centers:                          # centers (if any) carry all 3 fields
-                assert set(c) == {"position", "radius", "presence"}
+                assert set(c) == {"position", "radius"}
                 assert len(c["position"]) == 3
     assert records == data                                  # return value matches file

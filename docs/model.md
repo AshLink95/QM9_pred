@@ -196,21 +196,29 @@ centers = centroid + offsets                          # [S,M,3]  equivariant
   ([primer §9](jax_flax_primer.md) for the index intuition).
 
 ```python
-rp = jnp.sum(_mlp(...)(h), axis=0).reshape(S, M, 2)   # [S,M,2] invariant per-slot readouts
-radii    = nn.softplus(rp[..., 0])                    # [S,M] > 0
-presence = nn.sigmoid(rp[..., 1])                     # [S,M] in (0,1)
+rp = jnp.mean(_mlp(...)(h), axis=0).reshape(S, M)     # [S,M] invariant per-slot readout
+offset = self.param("radius_offset", ...)             # starts at softplus⁻¹(dataset mean radius)
+radii  = nn.softplus(rp + offset)                     # [S,M] > 0
 ```
-- `radii` and `presence` are invariant scalars (from `h`, summed over atoms). `softplus` keeps
-  radius positive; `sigmoid` keeps presence a 0–1 "is this slot a real center?" gate.
-- **presence** is what lets a *fixed* `M` slots represent a *variable* number of true centers: an
-  unused slot learns `presence ≈ 0`, and in [losses](losses.md) it enters as amplitude, so a
-  zero-amplitude Gaussian contributes nothing to the cloud (CLAUDE.md §6).
+- `radii` are invariant scalars from `h`. The readout is a **mean** over atoms: a center's size
+  doesn't grow with the molecule (unlike energy, which is a **sum**).
+- `softplus` keeps radii positive. `radius_offset` is a trainable scalar that starts at the
+  inverse-softplus of the training set's mean radius (`radius_init`, set at training start like
+  `atom_ref`). The model therefore starts at the "constant guess" (0.05 Å error) instead of
+  arbitrary sizes.
+- **How many slots are real is not predicted.** Spin `s` has `k = Σ valence/2` centers
+  (`data/electrons.py`), and the first `k` slots of that spin are its centers. An earlier
+  presence score (sigmoid gate per slot) was removed: together with predicted widths in the loss,
+  it let the model blur several centers into a few faint blobs (CLAUDE.md §6 "Revised loss").
+- Spin up and spin down have separate slots (`S = 2`) and are never mixed.
 
 ## 6. `model.py` — assembly
 
 `QM9Model.__call__(z, pos)` = embed `z`→`h`, set `x=pos`, run `EGNNBackbone`, then both heads;
-returns `{"energy": scalar, "wannier": {centers, radii, presence}}`. `model_from_config(cfg)`
-reads `configs/*.yaml` and constructs it — no magic numbers in code (CLAUDE.md §11).
+returns `{"energy": scalar, "wannier": {centers[S,M,3], radii[S,M]}}`. `model_from_config(cfg,
+atom_ref=…, radius_init=…)` reads `configs/*.yaml` and constructs it — no magic numbers in code
+(CLAUDE.md §11). `atom_ref` and `radius_init` are only initial values, fitted from the train
+split at training start; inference loads the trained values from the checkpoint.
 
 ---
 
@@ -232,5 +240,6 @@ reads `configs/*.yaml` and constructs it — no magic numbers in code (CLAUDE.md
    scalar-weighted coord update. **Test equivariance now on random weights** ([symmetry](symmetry.md)).
 3. Stack into `EGNNBackbone`.
 4. `EnergyHead` (sum of per-atom scalars) → train energy-only first.
-5. `WannierHead` (centroid + einsum offsets, softplus radius, sigmoid presence).
+5. `WannierHead` (centroid + einsum offsets per spin; mean-pooled softplus radius starting
+   at the dataset mean; no presence: the count comes from `data/electrons.py`).
 6. Wire in `model.py`, drive hyperparameters from config.

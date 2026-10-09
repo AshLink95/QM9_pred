@@ -1,143 +1,235 @@
 # QM9 → Wannier + Energy Predictor
 
-An **E(3)-equivariant graph neural network** that predicts converged SIESTA electronic-structure
-outputs — total energy and Wannier centers (with radius + spin) — from atomic geometry alone
-(`Z` + positions). Symmetry (rotation / translation / permutation / mirror) is **guaranteed by
-the architecture** (EGNN), not approximated by data augmentation.
+A neural network that takes a molecule's **atoms and their positions** and predicts what an
+expensive quantum-chemistry calculation (SIESTA + Wannier90) would produce:
+- the molecule's **total energy** (eV);
+- its **Wannier centers**, the points where its electron pairs sit (one per bond / lone pair),
+  each with a **radius**, separately for **spin up** and **spin down**.
 
-The design decisions and their rationale live in [`CLAUDE.md`](CLAUDE.md) — that file is the
-source of truth; read it before changing anything load-bearing. For **how it's implemented**
-(EGNN line-by-line, the equivariance proof, JAX/Flax syntax, failure modes), see
-[`docs/`](docs/README.md).
+A calculation that takes minutes per molecule becomes a millisecond prediction. The network is an
+**E(3)-equivariant graph neural network (EGNN)**: rotating, moving, mirroring, or relabeling a
+molecule is *guaranteed* to rotate, move, mirror, or leave unchanged the predictions, by the
+architecture itself.
 
-## Stack
+**New to the project?** Start with [`docs/README.md`](docs/README.md). It gives a reading order
+that starts from zero physics and zero machine learning (physics primer → ML primer → developer
+guide → one doc per code directory) plus a glossary. Design decisions and their reasons are in
+[`CLAUDE.md`](CLAUDE.md).
 
-JAX + Flax (model) · Optax (optimization) · closed-form Gaussian-cloud loss for the unordered
-Wannier center set. No `e3nn` (L≤1 targets only). Python ≥3.14.
+---
 
+## 1. Requirements
+- Linux or macOS, Python 3.14 (installed automatically by `uv`).
+- [`uv`](https://docs.astral.sh/uv/) for environments: `curl -LsSf https://astral.sh/uv/install.sh | sh`.
+- For training: an NVIDIA GPU is recommended (one is enough). CPU works but is slower.
+- The data: SIESTA/Wannier90 output folders (`.fdf`, `.out`, `.wout` per molecule).
+
+## 2. Install
 ```bash
-uv sync                      # install deps
-uv run pytest tests/ -q      # parsers, equivariance gate, loss, end-to-end training
+git clone <repo> && cd QM9_pred
+uv sync --group eval              # code + plotting for the accuracy report
+uv sync --group eval --group gpu  # same, plus CUDA jax, on a machine with an NVIDIA GPU
+uv run pytest -q                  # all tests should pass (~20 s)
 ```
+`uv sync --group X` installs exactly the groups you list and **removes the others**. On a GPU
+machine always include `--group gpu`, or the CUDA version of jax gets uninstalled.
 
-## Pipeline (mirrors the directory layout)
-
-| Stage | Module | Role |
+| Group | Adds | Needed for |
 |---|---|---|
-| Parse | `data/parse_siesta.py`, `data/parse_wout.py` | `.fdf`/`.out` → Z, pos, energy; `.wout` Final State → centers, radii, spin |
-| Graph | `data/graph.py` | fully-connected edges, distances, relative vectors (deterministic, no learning) |
-| Model | `model/egnn.py`, `model/heads.py`, `model/model.py` | EGNN backbone + energy/Wannier heads (all learning) |
-| Loss | `losses/energy.py`, `losses/wannier_cloud.py` | squared-error energy + ordering-free Gaussian-cloud Wannier loss (split by spin) |
-| Train | `training/` | optax loop, combined weighted loss, metrics |
-| Symmetry | `symmetry/transforms.py` + `tests/test_equivariance.py` | the correctness guarantee, tested explicitly |
+| *(default)* | jax, flax, optax, scipy, pyyaml, pytest | everything |
+| `gpu` | `jax[cuda12]` (bundles its own CUDA; needs only the NVIDIA driver) | GPU training |
+| `eval` | matplotlib | `scripts/evaluate.py` (the accuracy report) |
+| `notebook` | jupyter kernel, matplotlib, nbconvert | the demo notebooks |
 
-`data/` is deterministic prep; `model/` is all learning. The graph is the interface — the model
-never parses files, the loss never builds graphs.
+## 3. The workflow, step by step
 
-## Usage
+Locally, prefix commands with `uv run`. **On a cluster compute node use `.venv/bin/python`
+instead of `uv run`** (see §4). Every script has `--help`.
 
+### Step 1 — Build the dataset (once)
 ```bash
-uv run python -m scripts.build_dataset  root1/ root2/ ...  --out dataset.pkl   # 1+ roots, each recursed
-uv run python -m scripts.train          --config configs/default.yaml --dataset dataset.pkl --out params.msgpack
-uv run python -m scripts.evaluate       --config configs/gpu.yaml --params params.msgpack   # accuracy report (test split)
-uv run python main.py                   path/to/molecule.fdf --params params.msgpack   # one molecule → stdout
-uv run python main.py                   path/to/fdf_dir/ --params params.msgpack --out predictions.json  # batch → one .json
+uv run python -m scripts.build_dataset /path/to/parent --out dataset.pkl
 ```
+- Give one or more folders. Each is searched **recursively**. The `.fdf`, `.out`, and `.wout`
+  of a molecule may sit in different subfolders (e.g. `done/`, `out_files/`, `wout_files/`).
+  They're matched by **molecule id**, the filename up to the first `.` (e.g. `C2F3N3O_133481`).
+- Each molecule needs `<id>.fdf`, `<id>…out`, and one `.wout` per spin whose name contains `up`
+  or `down`.
+- Incomplete or unconverged molecules are **skipped and counted**, not fatal (a few hundred of
+  ~118k here).
+- Output: `dataset.pkl` (all parsed molecules, ~118k). Rebuilding it changes the train/val/test
+  split, so retrain after any rebuild.
 
-`build_dataset` walks each root recursively and pools all molecules into one `dataset.pkl` —
-pass as many roots as you like. Files are matched by **molecule id** (the filename up to the
-first `.`, e.g. `C2F3N3O_133481`), so the `.fdf`, `.out`, and `.wout` for a molecule may live in
-separate roots (`done/*.fdf`, `out_files/*.out`, `wout_files/*.wout`). `.wout` files supply the
-converged Wannier targets for training; molecules missing an `.out` or a spin `.wout` are
-skipped with a count.
-
-`main.py` predicts from `.fdf` geometry alone (no `.wout` needed — those are training labels).
-A directory reads only its `.fdf` files and writes one JSON array of
-`{input, energy, wannier}` records. Energy-only ablation (build-order step 5):
-`--config configs/energy_only.yaml`.
-
-## Training on a cluster (Slurm)
-
-**Never run `uv run` inside a job** — compute nodes have no internet, so `uv` blocks forever
-syncing the venv (a 0-CPU wall-clock timeout). Sync once on the **login node**, then submit a
-job that calls the venv's Python directly:
-
+### Step 2 — Train (one run, or a whole sweep)
+**One run:**
 ```bash
-uv sync                       # login node (CPU)
-uv sync --group gpu           # login node, for CUDA (jax[cuda12])
+uv run python -m scripts.train --config configs/gpu.yaml --dataset dataset.pkl --out params.msgpack
 ```
+(On a cluster: `bash scripts/train-gpu.sh` from your sbatch file, §4.)
+- Splits the molecules 80 / 10 / 10 into train / validation / test using `train.split_seed`
+  (fixed, so every run is tested on the same molecules).
+- Uses every GPU the job can see (data parallel); the log says `data-parallel over N device(s)`.
+- Learning rate: 5-epoch warmup, then cosine decay to 1% (`train.lr_schedule`).
+- Every `ckpt_every` epochs it validates and prints one line: training loss terms, then
+  `val obj` (lower = better), validation energy error (eV), per-spin center error and radius error
+  (Å), and `* new best` when it improves.
+- Files next to `--out`: `params.msgpack` (**best** epoch: what evaluate/predict use),
+  `params.last.msgpack` (resumable state), `params.best.json` (best epoch's metrics),
+  `params.progress.json`.
+- **Resumes automatically** from `params.last.msgpack`, identically to an uninterrupted run, so a
+  time-out means resubmit. On Slurm's time-limit signal it saves first. To start fresh, move the
+  `params*` files away.
+- `train.patience` > 0 stops a run early when validation stops improving.
+- The first epoch is slow (~30 min of one-time compilation); the compile cache (`.jax_cache/`)
+  makes later jobs skip it.
 
-Then from your own sbatch file (where you keep `#SBATCH` specs, module loads, etc.) call one of:
-
+**A sweep** (13 planned variants, then a long final run of the winner), spread over many jobs:
 ```bash
-bash scripts/train.sh        # CPU: configs/default.yaml
-bash scripts/train-gpu.sh    # GPU: configs/gpu.yaml (batch_size 256); errors out if no GPU visible
+bash scripts/train-bunch.sh                                  # submit this from N jobs (§4)
+.venv/bin/python -m scripts.sweep status configs/sweep.yaml  # progress table
 ```
+Each job claims the next unclaimed run, trains it, writes its test report, and takes another. A
+run whose job dies resumes in another job. Results land in `runs/<sweep name>/<run>/`. Full
+guide: [docs/sweeps.md](docs/sweeps.md).
 
-Both run `.venv/bin/python -u -m scripts.train` (edit config/dataset/out paths inside). The GPU
-script additionally checks JAX sees a `gpu` device and **fails fast** (instead of silently
-training on CPU) if you forgot `uv sync --group gpu` or landed on a non-GPU node. Do **not**
-`module load cuda` — `jax[cuda12]` bundles its own CUDA libs; you only need the NVIDIA driver
-(`nvidia-smi`). Training prints (unbuffered) the JAX devices at startup (confirm `CudaDevice` on GPU),
-a per-epoch `train loss / val E-MAE / seconds` line, and `checkpoint saved -> params.msgpack @
-epoch N` every `ckpt_every` epochs. Checkpointing is automatic and **resumes** if the `--out` file
-already exists — a wall-kill just means resubmit. On GPU, raise `train.batch_size` (256–512) so
-the batches fill the device.
-
-## Accuracy report (`scripts/evaluate.py`)
-
-Compares the model's predictions with the parsed SIESTA truth for energy and Wannier centers.
-
+### Step 3 — Measure accuracy
 ```bash
-uv sync --group gpu --group eval     # login node; ALWAYS list every group you use (see below)
-.venv/bin/python -m scripts.evaluate --config configs/gpu.yaml --params params.msgpack
-.venv/bin/python -m scripts.evaluate --config configs/gpu.yaml --params params.msgpack \
-    --data-dir /path/to/fresh_parent            # your own set: recursive .fdf/.out/.wout
+uv run python -m scripts.evaluate --config configs/gpu.yaml --params params.msgpack
+uv run python -m scripts.evaluate --config configs/gpu.yaml --params params.msgpack \
+    --data-dir /path/to/new_molecules      # optional: your own test set, parsed fresh
 ```
+- **Pass the same config the model was trained with**: it fixes the model size and the split.
+- Default: scores the **test split**, ~11.8k molecules training never saw. `--subset
+  val|train|all` scores other parts; train vs test shows memorization.
+- Writes `accuracy_report/` (or `--out-dir`):
+  - `summary.txt`: energy error (MAE, RMSE, median, p95, max, bias) next to the composition-only
+    baseline; per-spin Wannier center error (Å), radius error, count accuracy; a rotation
+    symmetry check. Also printed.
+  - `molecules.csv`: per molecule, SIESTA vs predicted energy and per-spin errors.
+  - `centers.csv`: per center, SIESTA's position and radius next to the matched prediction.
+  - `accuracy.png`: six panels of error distributions.
+- How to read these numbers (what is good or bad): [docs/ml_primer.md](docs/ml_primer.md) §13.
 
-- **Default:** the **test split** of `dataset.pkl`: the ~11.8k molecules training never saw.
-  The split is recomputed with the config's seed and fractions, so pass the config the model
-  was trained with, and don't rebuild `dataset.pkl` in between. `--subset val|train|all` scores
-  other parts (e.g. `train` vs `test` shows the memorization gap).
-- **`--data-dir ROOT [ROOT ...]`:** parses a fresh set. Each root is searched recursively and
-  files are matched by molecule id, like `build_dataset`. Incomplete molecules are listed as
-  skipped.
-- **Wannier accuracy:** predicted centers (slots with presence > `--presence-threshold`, default
-  0.5) are Hungarian-matched to the true centers. Reported as center error in Å (MAE / RMSE /
-  median / p95), radius error, and **count accuracy** (predicted count = true count). Matching is
-  evaluation-only; the training loss is still the Gaussian cloud.
-- **Outputs** in `--out-dir` (default `accuracy_report/`):
-  - `summary.txt`: the tables, also printed. Includes a composition-only energy baseline and a
-    rotation-symmetry spot check.
-  - `molecules.csv`: per molecule: formula, true vs predicted energy, per-spin counts and errors.
-  - `centers.csv`: the raw data, one row per center: parsed xyz + radius next to the matched
-    predicted xyz + radius + presence and the distance. `missed` / `extra` rows show
-    unmatched centers.
-  - `accuracy.png`: energy error vs energy, energy error histogram, center-distance histogram
-    per spin, count-error bars, radius parity, per-molecule center error.
+### Step 4 — Predict new molecules
+```bash
+uv run python main.py molecule.fdf --config configs/gpu.yaml --params params.msgpack
+uv run python main.py folder_of_fdfs/ --config configs/gpu.yaml --params params.msgpack --out predictions.json
+```
+Only `.fdf` geometry is needed. One file prints a readable block; a folder (only its `.fdf`
+files, not recursive) writes one JSON array:
+```json
+[{"input": "mol1.fdf", "energy": -2421.40,
+  "wannier": {"up":   [{"position": [0.01, 0.02, 0.70], "radius": 0.85}, ...],
+              "down": [{"position": [0.01, 0.02, 0.70], "radius": 0.85}, ...]}}]
+```
+Each spin lists (valence electrons) / 2 centers. A file that fails to parse becomes
+`{"input": …, "error": …}` instead of stopping the run.
 
-⚠ **`uv sync --group X` uninstalls packages from groups you don't list.** `uv sync --group eval`
-alone would remove the CUDA jax. Use `uv sync --group gpu --group eval`.
+## 4. Running on a Slurm cluster
+1. On the **login node** (needs internet): `uv sync --group gpu --group eval`.
+2. Put resources in **your own** sbatch file and call the repo's launcher:
+   ```bash
+   #!/bin/bash
+   #SBATCH --partition=<gpu partition>
+   #SBATCH --gres=gpu:1            # more GPUs also work (batch_size must divide evenly)
+   #SBATCH --cpus-per-task=4       # CPUs prepare batches and run the matching each step
+   #SBATCH --mem=32G
+   #SBATCH --time=12:00:00
+   #SBATCH --output=train_%j.out
+   #SBATCH --error=train_%j.err
+   cd /path/to/QM9_pred
+   bash scripts/train-gpu.sh       # or: bash scripts/train.sh  (CPU, configs/default.yaml)
+   ```
+3. Edit the `--config`, `--dataset`, `--out` lines inside the launcher if needed.
 
-## Demo notebooks (`notebooks/`)
+**For a sweep**, the same file with a job array and the sweep launcher:
+```bash
+#SBATCH --array=1-6               # 6 jobs work through configs/sweep.yaml together
+#SBATCH --signal=B:USR1@300       # 5-min warning before the time limit -> clean hand-back
+...
+bash scripts/train-bunch.sh       # status: .venv/bin/python -m scripts.sweep status configs/sweep.yaml
+```
+Failed run: read `runs/<sweep>/<run>/error.txt`, then
+`python -m scripts.sweep requeue configs/sweep.yaml <run>`. Start stage 2 early:
+`python -m scripts.sweep promote configs/sweep.yaml`.
 
-Presentation + onboarding; run on a hardcoded methane molecule, no real data required.
-Install the group and open with `uv run --group notebook jupyter lab`.
+- **Never call `uv run` inside a job.** Compute nodes have no internet; `uv` blocks forever
+  (symptom: timeout, 0% CPU, empty log). The launchers call `.venv/bin/python` directly.
+- `train-gpu.sh` stops with a clear error if JAX can't see a GPU. Don't `module load cuda`:
+  `jax[cuda12]` brings its own CUDA.
+- Evaluation and prediction are light; run them as a small job too, with
+  `.venv/bin/python -m scripts.evaluate …`.
 
+## 5. Configuration (`configs/*.yaml`)
+| Key | Meaning |
+|---|---|
+| `model.hidden_dim`, `model.n_layers` | network width and depth |
+| `model.rbf.*` | how distances are expanded into features |
+| `wannier.max_centers` | output slots per spin (must be ≥ the largest molecule's count; 28 here) |
+| `wannier.spins` | `[up, down]` |
+| `wannier.guide_sigma` | fixed width (Å) of the smooth guide term in the Wannier loss |
+| `wannier.radius_weight`, `wannier.guide_weight` | weights of the radius and guide terms |
+| `loss.lambda_energy`, `loss.lambda_wannier` | weights of the energy and Wannier losses (`0` turns one off) |
+| `train.lr`, `train.grad_clip` | peak learning rate, gradient-clipping limit |
+| `train.lr_schedule`, `train.warmup_epochs`, `train.lr_end_frac` | `cosine` (warmup, then decay to `lr·lr_end_frac`) or `constant` |
+| `train.patience` | early stopping: validations without improvement before stopping (0 = off) |
+| `train.batch_size`, `train.epochs`, `train.ckpt_every` | batch size (32 CPU / 256 GPU), epochs, checkpoint interval |
+| `train.seed` | initial weights + batch order |
+| `train.split_seed`, `train.val_frac`, `train.test_frac` | the train/val/test split (keep `split_seed` fixed) |
+
+Files: `default.yaml` (CPU), `gpu.yaml` (GPU, larger batches), `energy_only.yaml` (energy alone,
+for a quick sanity check), `sweep.yaml` (the planned sweep: base config, 13 variants, stage
+settings; see [docs/sweeps.md](docs/sweeps.md)).
+
+## 6. Tests and notebooks
+```bash
+uv run pytest -q                               # whole suite
+uv run pytest tests/test_equivariance.py -q    # the symmetry guarantee alone
+uv sync --group eval --group notebook
+uv run --with jupyterlab jupyter lab notebooks/   # or open them in VS Code's notebook editor
+uv run jupyter nbconvert --to notebook --execute --inplace notebooks/*.ipynb   # re-run headless
+```
 | Notebook | Shows |
 |---|---|
-| `equivariance_showcase.ipynb` | the flagship: rotate/translate/mirror/permute → energy fixed, centers transform exactly (on the **untrained** net) |
-| `pipeline_walkthrough.ipynb` | `.fdf` → parse → graph → EGNN → prediction, stage by stage (the data/model boundary) |
-| `wannier_loss.ipynb` | the Gaussian-cloud loss: zero on identical sets, order-invariant, spin-split, smooth gradient everywhere |
-| `inspect_predictions.ipynb` | predicted vs true energy/centers (fabricated data now; auto-loads `params.msgpack`/`dataset.pkl` when present) |
+| `equivariance_showcase.ipynb` | rotate/move/mirror/relabel a molecule; outputs follow exactly, even untrained |
+| `pipeline_walkthrough.ipynb` | `.fdf` → parsing → graph → network → prediction |
+| `wannier_loss.ipynb` | how the Wannier loss works: count from composition, matched positions and radii per spin |
+| `inspect_predictions.ipynb` | predicted vs true (fake data, or your `params.msgpack` + `dataset.pkl` if present) |
 
-Shared helpers live in `notebooks/demo_utils.py`. Re-run headless with
-`uv run jupyter nbconvert --to notebook --execute --inplace notebooks/*.ipynb`.
+## 7. Troubleshooting
+| Symptom | Fix |
+|---|---|
+| cluster job times out with 0% CPU and an empty log | you used `uv run` in the job; use the launchers |
+| `no GPU visible to JAX` | `uv sync --group gpu --group eval` on the login node; check `nvidia-smi` |
+| `LLVM compilation error: Cannot allocate memory` | don't change the batching in `training/train.py` (see `docs/training.md` §1) |
+| `train loss nan` / `NON-FINITE loss …` | training diverged; see `docs/training.md` §5 |
+| `params.msgpack doesn't match …` in evaluate | evaluate with the config used for training |
+| `no valence charge for element(s)` | a new element; see `docs/developer_guide.md` §5c |
+More: [docs/developer_guide.md](docs/developer_guide.md) §7.
 
-## Status
+## 8. Project layout
+```
+data/       parsing, file matching, the split, center counts          (no learning)
+model/      the EGNN and its energy / Wannier outputs                  (all the learning)
+losses/     the Wannier loss (matched, per spin) and the cloud overlap
+training/   training loop, metrics, accuracy report
+symmetry/   transforms used by the symmetry tests
+scripts/    command-line entry points + Slurm launchers
+configs/    every tunable number
+tests/      pytest suite
+notebooks/  demos only
+docs/       documentation, from zero background
+```
 
-Full pipeline is wired and tested end-to-end on fabricated molecules. **Real SIESTA samples are
-not yet present** — parsers are written to the format spec (`CLAUDE.md §9`); hand-verification
-against real `.fdf`/`.out`/`.wout` and real training are the remaining steps once data lands.
-The file-stem matching convention in `data/dataset.py` is the one assumption to confirm against
-real filenames.
+## 9. Status
+- **v1 model** (first full training, Gaussian-cloud Wannier loss): test energy MAE **0.168 eV**
+  (composition baseline 0.913 eV). Wannier centers were not usable (center error 0.61 Å, count
+  right 0.1%).
+- **Current code** replaces the Wannier loss: center count computed from composition, per-spin
+  Hungarian-matched positions and radii, fixed-width guide (CLAUDE.md §6). **Awaiting retrain**;
+  targets: count 100%, radius ≤ 0.05 Å, center error well below 0.1 Å (label noise floor
+  ~0.013 Å), energy ≤ 0.168 eV.
+- Training now has multi-GPU data parallelism, best-epoch keeping with exact resume, per-epoch
+  Wannier metrics, a cosine learning-rate schedule, early stopping, and a parallel sweep queue
+  (`configs/sweep.yaml`, `scripts/train-bunch.sh`). Next step: run the sweep.
+- Not implemented: molecule ids saved in `dataset.pkl`; multi-node training.

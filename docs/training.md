@@ -1,165 +1,204 @@
-# `training/` — the optimization loop (JAX/optax idioms)
+# `training/` — the training loop, step by step
 
-Ties [model](model.md) + [losses](losses.md) together and drives the weights with gradient
-descent. This is the doc to read for **how JAX training actually looks**. Syntax:
-[jax_flax_primer](jax_flax_primer.md). Rationale: `../CLAUDE.md` §6, §10.
+How the weights actually get trained. Background first if needed: [ml_primer](ml_primer.md)
+(loss, gradient descent, epochs, schedules, data parallelism) and [jax_flax_primer](jax_flax_primer.md)
+(`jit`, `vmap`, sharding syntax). Running many trainings in parallel is in [sweeps](sweeps.md).
+Rationale of record: `../CLAUDE.md` §6, §10.
 
-Files: `train.py` (batching, loss, loop, checkpointing), `loss.py` (example → JAX arrays for
-eval), `metrics.py` (per-molecule eval metrics).
+Files: `train.py` (the loop), `metrics.py` + `report.py` (evaluation), `sweep.py` (the parallel
+queue, see [sweeps](sweeps.md)), `loss.py` (a small converter for evaluation helpers).
 
 ---
 
-## 1. Why batched, and how molecules become batches
+## 0. The big picture
 
-The first version trained **one molecule per step**. On 118k real molecules that failed twice:
-it was slow (one Python dispatch per molecule), and it crashed with `LLVM compilation error:
-Cannot allocate memory`. The cause was a **shape storm**: `jax.jit` compiles once per distinct
-input shape ([primer §6](jax_flax_primer.md)), and the Wannier loss shape depends on each
-molecule's true center count `K`, so every `(N, K_up, K_down)` combination compiled separately.
-Thousands of compilations exhausted the compiler's memory.
-
-The fix is to make shapes few and fixed:
-
-```python
-def _batches(examples, batch_size, n_spins, kmax, rng):
-    buckets = defaultdict(list)
-    for e in examples:
-        buckets[len(e["z"])].append(e)        # group by atom count N
-    ...                                        # shuffle, cut each bucket into batch_size chunks
-    yield _stack(chunk, n_spins, kmax)
+```
+dataset.pkl ──split (split_seed)──► train 80% / val 10% / test 10%
+train molecules ──stack_buckets──► arrays grouped by atom count (done once)
+every epoch:
+   producer thread: pick batches ──► move to GPU(s) ─┐
+   main loop:   fwd(next batch) ──► CPU pairs centers (Hungarian, threads)
+                step(current batch, pairing) ──► updated weights
+every ckpt_every epochs: validate ──► print line ──► save "last" (+ "best" if improved)
 ```
 
-- **Bucket by atom count `N`.** Every molecule in a batch has the same `N`, so `z` stacks to
-  `[B, N]` and `pos` to `[B, N, 3]` with no atom padding and no masks inside the model.
-- **Pad Wannier targets to `Kmax`** (`_pad_wannier`): `centers[S, Kmax, 3]`,
-  `radii[S, Kmax]`, and a `mask[S, Kmax]` that is 1 for real centers and 0 for padding. The
-  mask becomes the Gaussian amplitude in the cloud loss, so padded centers contribute nothing
-  ([losses](losses.md) §5). `Kmax` = `wannier.max_centers` (28 for this dataset).
-- Distinct shapes are now one `(B, N)` per atom count, plus one for each bucket's last, smaller
-  batch. That's a few dozen compilations in total, all paid in epoch 0 (which is why epoch 0
-  takes ~30 min on the full dataset and later epochs ~6 s).
+Entry points: `scripts/train.py` (one run, launched by `scripts/train.sh` / `train-gpu.sh`) and
+`training/sweep.py` (many runs, launched by `scripts/train-bunch.sh`). Both call
+`train_with_status(cfg, examples, ckpt_path, should_stop)`.
 
-## 2. The batched loss
+## 1. Data preparation, done once — `stack_buckets`
 
-```python
-def _batch_loss(params, model, batch, lam_e, lam_w, ws, n_spins):
-    out = jax.vmap(lambda z, p: model.apply(params, z, p))(batch["z"], batch["pos"])
-    e = jnp.mean((out["energy"] - batch["energy"]) ** 2)
-    w = sum over spins of mean(jax.vmap(cloud_l2)(pred..., true..., mask as amplitude))
-    return lam_e * e + lam_w * w, (e, w)
-```
+- The split uses `train.split_seed` (default 0), **not** `train.seed`. `seed` controls weight
+  initialization and batch order; keeping the split seed fixed means runs with different seeds
+  are scored on the **same test molecules**.
+- Training molecules whose parsed Wannier count differs from valence electrons / 2 are dropped
+  with a warning (none expected).
+- Molecules are grouped by **atom count** and each group is stacked into NumPy arrays
+  (`z`, `pos`, `energy`, Wannier `centers`/`radii` padded to `max_centers`, the per-spin count
+  `k`). About 120 MB for the full dataset.
+- Why group by atom count: a batch is one array, and arrays need equal shapes. Same atom count
+  means no padding inside the model.
 
-- `jax.vmap(...)` turns the single-molecule `model.apply` into a batched one: it maps over the
-  leading `B` axis of `z`/`pos` while `params` is shared. Outputs gain a leading `B` axis
-  (`energy[B]`, `centers[B, S, M, 3]`, …).
-- The Wannier term calls `cloud_l2` from `losses/wannier_cloud.py` under `vmap`, once per spin
-  (up compared only with up). Predicted amplitude = presence, true amplitude = the pad mask.
-- `total = λ_E·E + λ_W·W` (CLAUDE.md §6). It returns `(total, (e, w))`: the second element is
-  **aux** data, so the loop can log the two terms separately
-  (`value_and_grad(..., has_aux=True)`, [primer §6](jax_flax_primer.md)).
-- `energy_only.yaml` sets `λ_W = 0`, which skips the Wannier computation entirely.
+## 2. Batches, every epoch — `epoch_batches`
 
-## 3. Energy reference — why the loss was ~1e12
+- Each group is shuffled and cut into `batch_size` chunks. The last chunk of a group is **topped
+  up** with random molecules from the same group, so **every batch has exactly `batch_size`
+  molecules**. That gives:
+  - one compiled program per atom count (JAX compiles once per shape; [primer §6](jax_flax_primer.md));
+  - batches that always split evenly across GPUs (§4).
+- Batch order is shuffled across groups. The shuffle uses `default_rng([seed, epoch])`, so a
+  resumed run replays exactly the same batches.
+- A **producer thread** (`_prefetch`) slices the arrays and copies the next two batches to the
+  devices while the main loop is busy, so the GPU never waits for batch preparation.
 
-SIESTA total energies are ~−1000 to −3000 eV, and a freshly initialized network outputs ~0. On
-the real data the energy MSE started around 1e12 and drowned out the Wannier term (~1e3). The
-huge errors drove the weights up until training diverged to NaN at epoch 41.
+> History: the first version trained one molecule per step and compiled a new program for every
+> combination of atom count and Wannier count, which ran out of compiler memory (`LLVM compilation
+> error: Cannot allocate memory`). Fixed shapes solved that.
 
-```python
-atom_ref, resid_std = _fit_atom_ref(train_ex, n_elements)   # least squares: E ≈ Σ_atoms ref[Z]
-model = model_from_config(cfg, atom_ref=atom_ref)            # seeds the model's per-element offset
-```
+## 3. One training step, and the CPU/GPU overlap
 
-`_fit_atom_ref` builds a `[molecules, elements]` matrix of atom counts and solves
-`counts @ ref ≈ E` with `np.linalg.lstsq`, using the **train** split only. The model adds
-`Σ_i ref[Z_i]` to its energy ([model](model.md) §5), so the network only has to learn the
-residual. Startup prints the fitted `ref` per element and the residual std. That std is roughly
-the MAE of a model that learned nothing beyond composition, so it's the baseline to beat.
-
-## 4. The step and the loop
+The Wannier loss needs a **pairing** of predicted to true centers (the Hungarian algorithm,
+[losses](losses.md) §3a), which runs on the CPU. To keep the GPU busy the loop is pipelined:
 
 ```python
-opt = optax.chain(optax.clip_by_global_norm(grad_clip), optax.adam(lr))
-
-@jax.jit
-def step(params, opt_state, batch):
-    (loss, parts), grads = jax.value_and_grad(_batch_loss, has_aux=True)(params, model, batch, ...)
-    updates, opt_state = opt.update(grads, opt_state, params)
-    return optax.apply_updates(params, updates), opt_state, loss, parts, optax.tree.norm(grads)
+nxt_out = fwd(params, next_batch)                     # GPU: predict the NEXT batch (no gradient)
+params, opt_state, loss, aux = step(params, opt_state, cur_batch, perm)   # GPU: train on current
+perm = pairing(next_batch, nxt_out["wannier"]["centers"])   # CPU, at the same time as `step`
 ```
 
-- `optax.chain` runs the transforms in order: **clip** the whole gradient pytree to global norm
-  ≤ `grad_clip` (config, default 1.0), then Adam. Clipping caps any single bad batch's effect.
-- `opt_state` is threaded forward every step. Adam keeps running moments, and dropping the
-  state resets them.
-- `model` and the λ's are closed over. `jax.jit` sees only arrays as arguments, so it compiles
-  once per batch shape (§1).
+- `fwd` and `step` are `jax.jit`-compiled. JAX dispatches them **asynchronously**: Python
+  continues immediately and the GPU executes in order. So while the GPU runs `step`, the CPU
+  computes the next pairing on a thread pool sized to the job's CPUs (`SLURM_CPUS_PER_TASK`).
+  SciPy releases Python's GIL, so the threads really run in parallel.
+- **Lagged assignment:** the pairing for a step is computed from predictions made one update
+  earlier. Pairings almost never change in one step, so this costs nothing measurable and buys
+  the overlap. Cost: one extra forward pass per step.
+- No host callback sits inside compiled code, which keeps both programs cacheable on disk (§8).
+- Per-step losses stay on the device and are fetched **once per epoch**. Fetching every step
+  would force the CPU to wait for the GPU each time.
+- `lambda_wannier: 0` (`energy_only.yaml`) skips `fwd` and the pairing entirely.
 
-Each epoch iterates `_batches`, converts each batch with `jnp.asarray`, and calls `step`.
+`step` computes `λ_E · energy MSE + λ_W · Wannier loss` (`_batch_loss`), its gradient, clips it
+(`train.grad_clip`), and applies Adam with the current learning rate.
 
-## 5. Checkpointing and the NaN guard
+## 4. Several GPUs — data parallelism
 
-- **Every `ckpt_every` epochs** (config, 5) and at the end, it prints
-  `epoch … train loss X (E … W …) val E-MAE … (Ns)` and saves params with
-  `flax.serialization.to_bytes` ([primer §8](jax_flax_primer.md)), then prints
-  `checkpoint saved -> … @ epoch N`.
-- **Resume:** if `--out` already exists, it's loaded as the starting params. It's **ignored**
-  (with a WARNING) if it contains NaN/inf or doesn't match the current architecture. An earlier
-  run resumed from a NaN checkpoint and trained NaN for 300 epochs; this check prevents that.
-- **NaN guard:** after every step it checks the loss. On the first non-finite value it prints
-  `NON-FINITE loss at epoch E step S: E-loss … W-loss … |grad| … (N atoms …)`, reverts to the
-  last finite params, saves those, and stops. The printed components show which term blew up.
-- A checkpoint is only written if every param is finite, so a bad step never overwrites a good
-  file.
+```python
+mesh = jax.make_mesh((n_devices,), ("data",), axis_types=(AxisType.Auto,))
+data_sh = NamedSharding(mesh, P("data"))   # split along the batch axis
+repl    = NamedSharding(mesh, P())         # full copy on every device
+```
+- Weights and optimizer state are **replicated**. Each batch (and its pairing) is **sharded**:
+  with 4 GPUs and `batch_size` 256, each GPU gets 64 molecules.
+- `jit` sees the shardings and splits the computation automatically. Each GPU computes gradients
+  on its slice, and XLA inserts an **all-reduce** that combines them. Every GPU then applies the
+  same update, so the replicas stay identical. The result equals single-GPU training up to float
+  rounding (`tests/test_multidevice.py` checks this).
+- `AxisType.Auto` asks XLA to work out the intermediate shardings itself; this JAX version's
+  default (`Explicit`) would require annotating every operation.
+- `batch_size` must be divisible by the number of devices (clear error otherwise). The log prints
+  `data-parallel over N device(s), M molecules per device per step`.
+- Only the GPUs of one job (one node). For more throughput across nodes, run a sweep
+  ([sweeps](sweeps.md)).
 
-Loading for inference (`main.py`, `scripts/evaluate.py`) builds a template with `model.init`,
-then fills it with `load_params`. The trained `atom_ref` values come from the checkpoint.
+## 5. Learning-rate schedule — `make_lr`
 
-## 6. Evaluation: `metrics.py`, `report.py`, `loss.py`
+`train.lr_schedule: cosine` (the default in the provided configs) builds
+`optax.warmup_cosine_decay_schedule`:
+- **Warmup:** the rate rises linearly from 0 to `lr` over `warmup_epochs` (5). Adam's internal
+  averages are unreliable in the first steps; small steps there avoid a bad start.
+- **Cosine decay:** then it falls along half a cosine wave to `lr · lr_end_frac` (1% of `lr`) at
+  the last planned epoch. Big steps early make fast progress; small steps late let the weights
+  settle instead of bouncing around ([ml_primer](ml_primer.md) §3).
+- Steps per epoch are fixed (§2), so the total length is known in advance. The schedule's step
+  counter lives inside the optimizer state, so a resumed run continues the curve exactly.
+- `lr_schedule: constant` keeps `lr` fixed (the old behavior).
 
-None of these are imported by the training loop.
+## 6. Validation, best epoch, early stopping
 
-- **`metrics.py:match_wannier`** scores one molecule and spin. Predicted slots with
-  presence > threshold count as centers. They're matched one-to-one to the true centers with
-  `scipy.optimize.linear_sum_assignment` (Hungarian: the pairing with the smallest total
-  distance). It returns per-pair distance (Å) and radius error, plus both counts. Leftovers on
-  either side are missed or extra centers. **`wannier_summary`** aggregates these into center
-  MAE / RMSE / median / p95, radius MAE, and count accuracy.
-  - Why matching is fine here but not as the loss (CLAUDE.md §6): scoring a finished
-    prediction needs no gradient and no padding, so the classic reasons against matching don't
-    apply. The training loss stays the Gaussian cloud.
-- **`report.py`** drives `scripts/evaluate.py`:
-  - `predict_all` is a batched forward pass bucketed by atom count. It returns outputs in input
-    order, and padding each chunk to `batch_size` keeps it to one compiled shape per atom count.
-  - `build_report` produces the per-molecule rows, per-center rows, and the summary.
-    `write_outputs` writes the CSVs, `summary.txt`, and `accuracy.png`.
-  - `load_fresh` parses new folders, reusing `data/dataset.py`'s helpers so molecule ids are
-    kept.
-  - `max_centers_from_checkpoint` reads the slot count from the checkpoint, so the model is
-    always rebuilt with the shapes it was trained with.
-- `energy_mae` (used by the smoke test) loops over molecules one at a time.
-  `loss.py:example_to_jax` converts a parsed NumPy example to JAX arrays for it.
-- Validation MAE during training uses the batched `_energy_mae_batched` in `train.py`.
+Every `ckpt_every` epochs (and at the last epoch), `_validate` predicts every validation molecule
+once, pairs centers on the host, and computes:
+
+| Value | Meaning |
+|---|---|
+| **val objective** | `λ_E · energy MSE + λ_W · (matched position MSE + radius_weight · normalized radius MSE)`: the training loss minus the guide term (the guide is only a training aid). **Lower = better; this picks the best epoch.** |
+| `E-MAE` | validation energy error, eV |
+| `center up/down` | per-spin matched center error, Å |
+| `radius` | matched radius error, Å |
+
+The line looks like:
+```
+epoch   40  lr 9.71e-04  train 0.4123 (E 0.0210  W 0.3913 = pos 0.3101 A^2, radius 0.6012, guide 0.2210) | val obj 0.3811  E-MAE 0.1512 eV  center up/down 0.2101/0.2098 A  radius 0.0412 A  * new best  (63.2s)
+```
+- `* new best`: the validation objective improved, so the parameters are saved as the best.
+- **Early stopping** (`train.patience`, 0 = off): after `patience` validations in a row without
+  a new best, training stops (`early stop: no improvement for N evaluations (best @ epoch E)`).
+  The best parameters are already on disk, so nothing is lost.
+
+## 7. Files, resume, stopping
+
+Next to `--out` (default `params.msgpack`):
+
+| File | Contents | Used by |
+|---|---|---|
+| `params.msgpack` | **best** parameters (lowest val objective) | `evaluate`, `main.py` |
+| `params.last.msgpack` | full training state: parameters, optimizer state (incl. schedule step), next epoch, best objective, epochs since best | resume |
+| `params.best.json` | the best epoch and its validation metrics | you, `sweep status` |
+| `params.progress.json` | current epoch, total, best so far | `sweep status` |
+
+- **Resume:** if `params.last.msgpack` exists, is finite, and matches the model, training
+  continues at the saved epoch with the same batches and learning-rate value; it's identical to
+  an uninterrupted run (`tests/test_schedule.py`). An incompatible or NaN file is ignored with a
+  WARNING. To start over, move these files away.
+- Files are written via a temp file + rename, so a kill mid-write never leaves a broken file.
+- **NaN guard:** if any step in an epoch produced a non-finite loss, the epoch is undone (weights
+  revert to the epoch start), the state is saved, and training stops with
+  `NON-FINITE loss at epoch E step S: E-loss … W-loss …`.
+- **Graceful stop:** `scripts/train.py` and the sweep worker catch SIGTERM / SIGUSR1 (Slurm sends
+  these at the time limit). The loop notices between steps, saves `last`, and returns `stopped`;
+  resubmitting resumes.
+- `train()` returns the best parameters; `train_with_status()` also returns the status:
+  `finished`, `early_stopped`, `stopped`, or `diverged`.
+
+## 8. Shared compile cache
+
+The launchers set `JAX_COMPILATION_CACHE_DIR` (default `.jax_cache/` in the repo). JAX stores
+compiled programs there and reuses them in later processes with the same shapes and devices, so
+the slow first-epoch compile (~30 min on the full dataset) is paid once instead of in every job
+and resubmission. Set `JAX_COMPILATION_CACHE_DIR=` (empty) to disable.
+
+## 9. Evaluation code
+
+- **`metrics.py:match_wannier`** scores one molecule and spin: the first `k` slots are matched
+  one-to-one to the true centers (`scipy.optimize.linear_sum_assignment`), returning per-pair
+  distance (Å), radius error, and both counts. `wannier_summary` aggregates MAE / RMSE /
+  median / p95 / radius MAE / count accuracy.
+- **`report.py:evaluate_checkpoint`** is the whole accuracy report in one call (used by
+  `scripts/evaluate.py` and by the sweep after each run): load the checkpoint, pick the molecules
+  (test split by `split_seed`, or fresh folders), predict in batches (`predict_all`), compare
+  (`build_report`), write CSVs, `summary.txt`, `accuracy.png`.
 
 ---
 
 ## Failure modes & debugging
 | Symptom | Cause | Where |
 |---|---|---|
-| `LLVM compilation error: Cannot allocate memory` | too many distinct shapes being compiled | §1: the bucketing/padding must stay |
-| epoch 0 takes ~30 min, later epochs seconds | one-time compile per batch shape | expected; §1 |
-| E-loss ~1e12, huge val E-MAE, then NaN | energy reference missing or removed | §3 |
-| W-loss explodes within one epoch | coordinate update unbounded | [model](model.md) §2 stabilizer |
-| `NON-FINITE loss …` line | divergence; the components tell which term | §5; lower `lr`, check λ balance |
-| `WARNING: … doesn't match this model` | checkpoint from an older architecture | expected after model changes; starts fresh |
-| only GPU 0 busy with 4 requested | no multi-GPU sharding implemented | request `--gres=gpu:1` |
-| job hangs with 0 CPU, empty log | `uv run` inside the job (no internet on compute nodes) | use `scripts/train*.sh` |
+| `train.batch_size=… must be divisible by the N visible devices` | batch doesn't split evenly | use a multiple of the GPU count (e.g. 256 for 1/2/4/8) |
+| first epoch ~30 min, later seconds | one-time compilation | expected; the compile cache (§8) skips it next time |
+| `ShardingTypeError … out_sharding` | mesh created in Explicit mode | keep `axis_types=(AxisType.Auto,)` (§4) |
+| `LLVM compilation error: Cannot allocate memory` | too many distinct shapes | keep fixed-size batches (§2) |
+| E-loss huge, then NaN | energy reference removed | [model](model.md) §5 |
+| `NON-FINITE loss …` | divergence; the line shows which term | lower `lr`, check λ balance |
+| val objective stops improving early | too high a learning rate, or real plateau | try `lr` 5e-4; cosine schedule; see [ml_primer](ml_primer.md) §12 |
+| `WARNING: … doesn't match this model` | `last` file from another architecture/config | expected after model changes; starts fresh |
+| only GPU 0 busy | `jax.devices()` sees one GPU | request `--gres=gpu:N`; check the `data-parallel over …` line |
+| job hangs with 0 CPU, empty log | `uv run` inside the job | use `scripts/train*.sh` |
 
 ## Rebuild-by-hand order
-1. `_pad_wannier` + `_stack` + `_batches` (bucket by `N`, pad `K`, mask). Check the batch shapes.
-2. `_batch_loss` with `vmap` and aux `(e, w)`.
-3. `_fit_atom_ref`, and seed the model's per-element offset with it.
-4. Optimizer chain (clip → Adam), jitted `step`.
-5. Epoch loop with the NaN guard, periodic finite-only checkpointing, and resume.
-6. Train `energy_only.yaml` first. Once val E-MAE drops below the residual std printed at
-   startup, move to the joint loss.
+1. `stack_buckets` + `epoch_batches` (fixed-size, top-up, seeded per epoch). Check shapes.
+2. `_batch_loss` with a given pairing; host `assign` ([losses](losses.md)).
+3. `fwd` / `step` under `jit`; the pipelined loop (§3); per-epoch loss fetch.
+4. Mesh + shardings (§4).
+5. `make_lr` (§5).
+6. `_validate`, best/last files, early stopping, resume, NaN guard, graceful stop (§6–7).
+7. Train `energy_only.yaml` first, then the full loss.

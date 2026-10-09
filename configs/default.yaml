@@ -12,7 +12,10 @@ model:
 wannier:
   max_centers: 28          # dataset global max (build_dataset reported max_centers=28). §6
   spins: [up, down]
-  width_scale: 1.0         # Gaussian width = width_scale * w_radii (§6: tie to physical radius)
+  guide_sigma: 0.3         # A; FIXED width of the cloud guide term (below the ~0.6-1 A gap
+                           #   between neighboring centers). Never predicted (§6).
+  radius_weight: 1.0       # weight of the matched radius regression (normalized by std)
+  guide_weight: 0.1        # weight of the fixed-width cloud guide vs matched positions
 
 loss:
   lambda_energy: 1.0
@@ -21,9 +24,14 @@ loss:
 train:
   lr: 1.0e-3
   grad_clip: 1.0            # clip global grad norm (stability safety net)
+  lr_schedule: cosine        # cosine = warmup then smooth decay to lr*lr_end_frac; or constant
+  warmup_epochs: 5           # linear ramp 0 -> lr over the first epochs
+  lr_end_frac: 0.01          # final learning rate = 1% of lr
   batch_size: 32           # on GPU raise to 256-512 so the vmap batches fill the device
   epochs: 300
   ckpt_every: 5            # checkpoint + val eval every N epochs (survives wall-kill, auto-resumes)
-  seed: 0
+  patience: 0               # early stop after N validations without a new best (0 = off)
+  seed: 0                   # initialization + batch order
+  split_seed: 0             # train/val/test split (keep fixed so runs share one test set)
   val_frac: 0.1
   test_frac: 0.1

@@ -7,8 +7,10 @@ cd "$(dirname "$0")/.."          # repo root
 
 export PYTHONUNBUFFERED=1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false     # don't grab all GPU memory up front
+# shared on-disk cache of compiled programs: resubmits skip the slow first-epoch compile
+export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR-$PWD/.jax_cache}"
 
 .venv/bin/python -u -m scripts.train \
     --config configs/default.yaml \
-    --dataset qm9.pkl \
+    --dataset dataset.pkl \
     --out params.msgpack

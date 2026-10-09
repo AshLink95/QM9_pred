@@ -8,6 +8,8 @@ cd "$(dirname "$0")/.."          # repo root
 
 export PYTHONUNBUFFERED=1
 export XLA_PYTHON_CLIENT_PREALLOCATE=false     # don't grab all GPU memory up front
+# shared on-disk cache of compiled programs: resubmits skip the slow first-epoch compile
+export JAX_COMPILATION_CACHE_DIR="${JAX_COMPILATION_CACHE_DIR-$PWD/.jax_cache}"
 
 # Fail fast if JAX can't see a GPU (else it would silently train on CPU for hours).
 .venv/bin/python -c "import jax,sys; \

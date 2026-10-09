@@ -1,10 +1,12 @@
-# `losses/` — energy regression + the Gaussian-cloud Wannier loss
+# `losses/` — energy regression + the matched Wannier loss
 
 Scores what [model](model.md) predicts against the parsed targets from [data](data.md); the
 scalar it returns is what [training](training.md) differentiates. Syntax:
-[jax_flax_primer](jax_flax_primer.md). Rationale: `../CLAUDE.md` §6 (the load-bearing decision).
+[jax_flax_primer](jax_flax_primer.md). Rationale: `../CLAUDE.md` §6 (the load-bearing decision,
+including the "Revised loss" and why the first version was replaced).
 
-Files: `energy.py` (trivial), `wannier_cloud.py` (the interesting one).
+Files: `energy.py` (trivial), `wannier_match.py` (the Wannier loss), `wannier_cloud.py` (the
+closed-form Gaussian overlap, used as the fixed-width guide term).
 
 ---
 
@@ -15,114 +17,135 @@ def energy_loss(pred_energy, true_energy):
     return jnp.mean((pred_energy - true_energy) ** 2)
 ```
 
-Plain mean-squared error on one invariant scalar. Nothing subtle. (`jnp.mean` over a single
-molecule is just the square; the `mean` matters only if you ever pass a batch vector.)
+Plain mean-squared error on one invariant scalar. (Training computes the same thing inline over
+a batch in `training/train.py:_batch_loss`.)
 
-## 2. Why the Wannier loss can't be element-wise
+## 2. The problem: comparing two unordered sets
 
-Predicted centers come out of `WannierHead` as `M` fixed slots per spin; true centers are an
-**unordered set of variable size** `K`. Predicted slot #k has *no* correspondence to true center
-#k. A loss like `Σ ‖pred[k] − true[k]‖²` would punish a perfectly correct set emitted in a
-different order — contradictory gradients. So we compare the two sets **without ordering** by
-turning each into a smooth density and comparing densities.
+Predicted centers come out of `WannierHead` as `M` slots per spin. True centers are an
+**unordered set**: predicted slot #k has no natural correspondence to true center #k. A loss
+like `Σ ‖pred[k] − true[k]‖²` would punish a perfectly correct set emitted in a different order,
+which gives contradictory gradients. Any Wannier loss has to be order-free.
 
-## 3. The density and the L2 between two densities
+### What went wrong with the first loss
+The first version turned each set into a smooth density of Gaussians and compared densities
+(§5 below). The model controlled each predicted Gaussian's **width** (radius) and **strength**
+(a presence score). On the test split it learned to cover the true centers with a few wide, faint
+blobs: count right 0.1% of the time, centers off by 0.61 Å, radii worse than a constant guess.
+With width and strength under its control, blurring scored well.
 
-Represent a set of centers as a sum of weighted isotropic Gaussians (a "cloud"):
+## 3. `wannier_match.py` — the current loss, per spin
 
+Three facts make a sharper loss possible:
+- **The count is known.** Spin `s` of a molecule has `k = Σ valence(Z) / 2` centers
+  (`data/electrons.py`; true for 100% of the dataset). The first `k` slots of that spin are its
+  predictions, with no presence score.
+- With a known count, **one-to-one matching** is clean (no existence scores, no padding games).
+- **Spin is separate everywhere:** every term below is computed per spin, so an up center can
+  never pair with a down center.
+
+### 3a. The pairing (Hungarian algorithm) — computed on the CPU
+```python
+perm = assign(pred_centers, true_centers, k, pool)   # NumPy + SciPy, on the host
+loss = wannier_match_loss(..., k, perm, ...)          # jitted, on the GPU
 ```
-ρ(x) = Σ_k  w_k · G(x; c_k, σ_k) ,    G(x; c, σ) = exp( −‖x − c‖² / (2σ²) )
+- For each molecule and spin, `scipy.optimize.linear_sum_assignment` on the `k × k` matrix of
+  squared distances finds the one-to-one pairing with the smallest total. `assign` does this for a
+  whole batch, spread over a **thread pool** (SciPy releases Python's GIL, so the threads truly
+  run in parallel).
+- `perm[b, s, i]` = which predicted slot is paired with true center `i`. Slots `≥ k` keep the
+  identity and are masked out.
+- The pairing is a discrete choice and **isn't differentiated** (as in DETR): inside the loss it
+  passes through `jax.lax.stop_gradient`. Gradients flow through the distances of the chosen pairs.
+- **Why on the CPU, outside the compiled step:** training overlaps it with GPU work. The CPU pairs
+  the *next* batch while the GPU trains on the current one, using predictions made one update
+  earlier (a "lagged assignment"; [training](training.md) §3). Keeping it out of compiled code also
+  lets the compiled programs be cached on disk and split across several GPUs. (An earlier version
+  called SciPy from inside the compiled step via `jax.pure_callback`; the GPU then sat idle during
+  every pairing.)
+
+### 3b. The terms
+```python
+mc  = take_along_axis(pred_c, perm)                  # predicted center paired with each true one
+mr  = take_along_axis(pred_r, perm)
+pos = Σ mask·‖true_c − mc‖² / n                      # Å²
+rad = Σ mask·((true_r − mr) / r_std)² / n            # dimensionless
+guide = mean over (molecule, spin) of cloud_l2(...)/k   # fixed width, unit amplitudes
+total = pos + radius_weight·rad + guide_weight·guide
 ```
+- `mask[b,s,i] = i < k[b,s]`: only real centers count, and `n` is how many there are.
+- **Position** is plain squared error on matched pairs. That's sharp: it keeps pushing until each
+  center sits on its partner.
+- **Radius** is regressed directly per matched pair, divided by the dataset's radius std
+  (`r_std`, measured on the train split at startup). The head's radius output starts at the
+  dataset mean ([model](model.md) §5), so training starts at "constant guess" quality.
+- **Guide** is the closed-form cloud overlap (§4–§5) with a **fixed** width `guide_sigma` (0.3 Å)
+  on both sides and amplitude 1 for every real center. Early in training the pairing can flip
+  from step to step. The guide doesn't care about pairing and gives a smooth pull toward the
+  right region. Because its width is fixed, it can't be gamed by widening blobs.
+- Weights come from `configs/*.yaml` (`wannier.radius_weight`, `wannier.guide_weight`); the
+  whole Wannier term is scaled by `loss.lambda_wannier` (0 in `energy_only.yaml` skips it
+  entirely).
 
-`w_k` is an amplitude (predicted **presence** for the model's cloud, `1` for a true center),
-`c_k` the center, `σ_k` the width. The loss is the squared L2 distance between the two clouds:
+## 4. `wannier_cloud.py` — the closed-form overlap (now the guide)
 
+A set of centers becomes a sum of isotropic Gaussians:
 ```
-L = ∫ (ρ_pred − ρ_true)²  dx
-  = ∫ρ_pred²  −  2∫ρ_pred ρ_true  +  ∫ρ_true²
-  =  ⟨p,p⟩    −      2⟨p,t⟩       +    ⟨t,t⟩
+ρ(x) = Σ_k  w_k · G(x; c_k, σ) ,    G(x; c, σ) = exp( −‖x − c‖² / (2σ²) )
+L    = ∫ (ρ_pred − ρ_true)² dx  =  ⟨p,p⟩ − 2⟨p,t⟩ + ⟨t,t⟩
 ```
-
-The trick (CLAUDE.md §6: **do not** grid or Monte-Carlo this integral): every one of those three
-terms is a sum of **pairwise Gaussian overlaps**, and the overlap of two isotropic Gaussians has
-a closed form. With variances `s = σ²`:
-
+Every term is a sum of **pairwise Gaussian overlaps**, and the overlap of two isotropic
+Gaussians has a closed form (variances `s = σ²`):
 ```
-O(a, b, s_a, s_b) = ∫ G(x;a,σ_a) G(x;b,σ_b) dx
-                  = (2π)^{3/2} · ( s_a s_b / (s_a + s_b) )^{3/2} · exp( −‖a−b‖² / (2(s_a+s_b)) )
+O(a, b, s_a, s_b) = (2π)^{3/2} · ( s_a s_b / (s_a + s_b) )^{3/2} · exp( −‖a−b‖² / (2(s_a+s_b)) )
 ```
+So it's a finite double sum, **O(n²)** in the number of centers, with no spatial grid, and
+differentiable everywhere (the `exp` never reaches exactly zero). CLAUDE.md §6: never compute it
+on a grid or by Monte Carlo.
 
-So `⟨p,t⟩ = Σ_{i,j} w^p_i w^t_j O(c^p_i, c^t_j, s^p_i, s^t_j)` — a finite double sum, **O(n²)** in
-the number of centers (tens), no spatial grid, and differentiable everywhere (the `exp` never
-flattens to exactly zero, so gradients survive even when clouds don't yet overlap).
-
-## 4. `_pairwise_overlap_sum` — the formula, vectorized
-
+## 5. `_pairwise_overlap_sum` — the formula, vectorized
 ```python
 def _pairwise_overlap_sum(ca, wa, sa, cb, wb, sb):
     d2     = jnp.sum((ca[:, None, :] - cb[None, :, :])**2, axis=-1)   # [A,B]  ‖a_i − b_j‖²
     ssum   = sa[:, None] + sb[None, :]                                # [A,B]  s_i + s_j
-    prefac = _TWO_PI_32 * (sa[:, None] * sb[None, :] / ssum) ** 1.5   # [A,B]  the (…)^{3/2} factor
+    prefac = _TWO_PI_32 * (sa[:, None] * sb[None, :] / ssum) ** 1.5
     overlap = prefac * jnp.exp(-d2 / (2.0 * ssum))                    # [A,B]  O(a_i, b_j)
-    return jnp.sum(wa[:, None] * wb[None, :] * overlap)               # scalar Σ w_i w_j O
+    return jnp.sum(wa[:, None] * wb[None, :] * overlap)               # Σ w_i w_j O
 ```
-
-- Same `[:, None, :]` broadcasting as the model ([primer §9](jax_flax_primer.md)): it forms the
-  full `[A,B]` matrix of every pair `(i,j)` at once, no loops.
-- `_TWO_PI_32 = (2π)^{3/2}` is precomputed at import.
-- The final `jnp.sum(w_i w_j O_ij)` collapses the matrix to the scalar term.
-
-`cloud_l2` assembles `⟨p,p⟩ − 2⟨p,t⟩ + ⟨t,t⟩` from three calls to it.
-
-## 5. `wannier_loss` — split by spin, widths from radii
-
-```python
-for s in range(S):                                # one cloud L2 per spin channel
-    pc, pr, pw = pred["centers"][s], pred["radii"][s], pred["presence"][s]
-    tc, tr     = true[s]["centers"], true[s]["radii"]
-    tw = jnp.ones(tc.shape[0])                     # true amplitude = 1
-    ps = (width_scale * pr) ** 2 + 1e-6            # variance from radius
-    ts = (width_scale * tr) ** 2 + 1e-6
-    total += cloud_l2(pc, pw, ps, tc, tw, ts)
-```
-
-- **Split by spin (CLAUDE.md §6):** up compares only to up, down only to down. An up center can
-  never overlap-cancel a down center because they live in separate `cloud_l2` calls. (This is the
-  `test_spin_split` property — swapping spins does not give zero.)
-- **Amplitudes:** predicted = `presence` (so an unused slot with presence≈0 vanishes from the
-  cloud — that's how a fixed `M` slots represent a variable count), true = `1`.
-- **Widths from `w_radii`:** `σ = width_scale · radius`, i.e. each Gaussian is as wide as that
-  center physically is. This uses the real per-center size and honors "not all Wanniers are the
-  same." `+1e-6` keeps variance strictly positive.
-- **Shapes:** `pred` is the stacked `[S,M,·]` dict from `WannierHead`; `true` is a length-`S`
-  **list** of `{centers[K_s,3], radii[K_s]}` — a list, not an array, because `K_up` and `K_down`
-  differ per molecule and per-molecule loss needs no padding.
+The `[:, None, :]` broadcasting ([primer §9](jax_flax_primer.md)) forms every pair at once.
+`cloud_l2` assembles `⟨p,p⟩ − 2⟨p,t⟩ + ⟨t,t⟩` from three calls. In the guide, padded entries
+have amplitude 0 and drop out.
 
 ## 6. Why not the alternatives (so you can defend it)
-- **Hungarian / Sinkhorn matching:** treats centers as identical points, needs padding to a
-  common count, and still imposes a (soft) correspondence. The cloud handles variable count for
-  free and is size-aware.
-- **Literal region/IoU overlap (union of balls):** volume has no closed form → forces a 3D grid
-  (millions of points/molecule/step) or Monte Carlo, and its gradient is exactly **zero** when
-  shapes don't yet touch (nothing tells the optimizer which way to move). The Gaussian form is
-  orders of magnitude cheaper and has gradients everywhere — see the "money plot" in
-  `notebooks/wannier_loss.ipynb`.
+- **Learned count / presence score:** the count is physics (valence electrons / 2), so learning
+  it only adds a way to fail. It's what let the first loss blur.
+- **Density loss with predicted widths:** width becomes a blur knob. That's the measured failure.
+- **Per-atom assignment (Deep Wannier style):** works in water, where every center clearly
+  belongs to one oxygen. In organics a C–C bond center sits exactly halfway between two carbons,
+  so "nearest atom" is a coin flip and per-atom counts vary.
+- **Chamfer distance:** no matching needed, but it allows duplicates (two predictions on one true
+  center). Matching rules that out.
+- **Literal region/IoU overlap:** no closed form (needs a grid) and zero gradient until shapes
+  touch.
 
 ---
 
 ## Failure modes & debugging
 | Symptom | Cause | Fix |
 |---|---|---|
-| loss can't separate two nearby centers | widths too large → clouds smear into one blob | lower `width_scale`; keep width tied to physical radius, no big free smoothing (§6) |
-| `test_zero_on_identical` fails at ~1e-7 | float32 rounding, not a bug | tolerance is `1e-5` in `tests/test_loss.py` on purpose |
-| gradients vanish | you reintroduced a hard cutoff / IoU-style term | keep the analytic Gaussian overlap |
-| up matches down | you built one cloud over both spins | keep the per-spin loop in `wannier_loss` |
-| `NaN` in loss | a radius reached 0 (no `softplus`) or `ssum=0` | `softplus` in the head (§5 of [model](model.md)), `+1e-6` here |
+| centers good but radius drifts | `radius_weight` too low, or `r_std` tiny | check the startup "Wannier radius: mean … std …" line |
+| training jumpy early, pairings flip | normal for matching at the start | the guide steadies it; raise `guide_weight` a bit if needed |
+| two predicted centers merge onto one true center | guide σ too large | keep `guide_sigma` below the ~0.6–1 Å spacing of neighboring centers |
+| `ValueError: no valence charge for element(s)` | a new element appeared | add it to `data/electrons.py:VALENCE` (must match the pseudopotentials) |
+| `WARNING: dropped N training molecules whose Wannier count != valence/2` | parsed count disagrees with the rule | inspect those molecules (open-shell? bad `.wout`?) |
+| up center paired with down | someone merged spins | every term must loop/index per spin |
+| `test_zero_on_identical` fails at ~1e-7 | float32 rounding | tolerance is `1e-5` on purpose |
 
 ## Rebuild-by-hand order
-1. Write `O(a,b,s_a,s_b)` and unit-test that `∫G_a G_b` matches it (or that identical clouds give
-   `⟨p,p⟩−2⟨p,t⟩+⟨t,t⟩ = 0`).
-2. `_pairwise_overlap_sum` (the `[A,B]` broadcast), then `cloud_l2` (the three terms).
-3. `wannier_loss`: loop spins, widths from radii, presence as amplitude.
-4. Sanity properties (mirror in `tests/test_loss.py`): zero on identical, order-invariant,
-   spin-split, positive when different.
+1. `centers_per_spin` (valence table, closed-shell rule).
+2. `cloud_l2` (closed-form overlap; zero on identical sets).
+3. Host `assign` (per-(molecule, spin) Hungarian on a thread pool) returning `perm`.
+4. `wannier_match_loss(…, perm)`: mask from `k`, matched position and radius terms
+   (`stop_gradient` on `perm`), fixed-width guide.
+5. Tests (`tests/test_wannier_match.py`): zero on a reordered truth, a known offset gives a known
+   value, spins never mix, gradients finite under `jit`, unused slots get no gradient.

@@ -9,15 +9,15 @@ dependencies = [
     "jax>=0.11.1",
     "optax>=0.2.8",
     "pyyaml>=6.0.3",
+    "scipy>=1.18.0",          # Hungarian matching in the Wannier loss (losses/wannier_match.py)
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
 ]
-eval = [                     # accuracy report (scripts/evaluate.py): plots + Hungarian matching
+eval = [                     # accuracy report (scripts/evaluate.py): plots
     "matplotlib>=3.11.1",
-    "scipy>=1.18.0",
 ]
 gpu = [
     "jax[cuda12]>=0.11.1",   # CUDA jaxlib (bundles CUDA libs; needs only a recent NVIDIA driver)

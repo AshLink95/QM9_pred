@@ -1,10 +1,10 @@
-"""Wannier cloud-loss properties (CLAUDE.md §6): zero on identical sets, order-invariant,
-spin-split."""
+"""Gaussian-cloud overlap (the fixed-width guide term): zero on identical sets, order-free.
+Spin-split behaviour of the full Wannier loss is tested in test_wannier_match.py."""
 
 import jax.numpy as jnp
 import numpy as np
 
-from losses.wannier_cloud import cloud_l2, wannier_loss
+from losses.wannier_cloud import cloud_l2
 
 
 def _cloud(seed, k=4):
@@ -33,19 +33,3 @@ def test_positive_when_different():
     c, w, s = _cloud(2)
     c2, w2, s2 = _cloud(3)
     assert float(cloud_l2(c, w, s, c2, w2, s2)) > 1e-3
-
-
-def test_spin_split():
-    # pred/true each: spin0 cloud at A, spin1 cloud at B (far apart).
-    A = jnp.array([[0.0, 0.0, 0.0]])
-    B = jnp.array([[10.0, 0.0, 0.0]])
-    r = jnp.array([0.5])
-    m = jnp.array([1.0])
-    pred = {"centers": jnp.stack([A, B]), "radii": jnp.stack([r, r]),
-            "presence": jnp.stack([m, m])}
-    true_aligned = [{"centers": A, "radii": r}, {"centers": B, "radii": r}]
-    true_swapped = [{"centers": B, "radii": r}, {"centers": A, "radii": r}]
-    aligned = float(wannier_loss(pred, true_aligned))
-    swapped = float(wannier_loss(pred, true_swapped))
-    assert aligned < 1e-6          # up<->up, down<->down match
-    assert swapped > 1e-3          # swapping spins must NOT cancel (no cross-spin match)

@@ -25,6 +25,7 @@ class QM9Model(nn.Module):
     n_basis: int = 16
     cutoff: float = 10.0
     atom_ref: tuple | None = None   # per-element reference energies (eV), init only; see below
+    radius_init: float | None = None  # dataset mean Wannier radius (Å), init only
 
     @nn.compact
     def __call__(self, z: jnp.ndarray, pos: jnp.ndarray) -> dict:
@@ -46,13 +47,16 @@ class QM9Model(nn.Module):
         e_ref = jnp.sum(nn.Embed(self.n_elements, 1, embedding_init=ref_init,
                                  name="atom_ref")(z))
         energy = EnergyHead(self.hidden_dim)(h) + e_ref
-        wannier = WannierHead(self.hidden_dim, self.max_centers, self.n_spins)(h, x)
+        wannier = WannierHead(self.hidden_dim, self.max_centers, self.n_spins,
+                              self.radius_init)(h, x)
         return {"energy": energy, "wannier": wannier}
 
 
-def model_from_config(cfg: dict, atom_ref: tuple | None = None) -> QM9Model:
-    """Build QM9Model from a parsed config dict (configs/*.yaml). `atom_ref` (training only)
-    initializes the per-element energy offsets from a fit to the training set."""
+def model_from_config(cfg: dict, atom_ref: tuple | None = None,
+                      radius_init: float | None = None) -> QM9Model:
+    """Build QM9Model from a parsed config dict (configs/*.yaml). `atom_ref` and `radius_init`
+    (training only) set initial values fitted from the training set; inference loads the
+    trained values from the checkpoint."""
     m = cfg["model"]
     return QM9Model(
         hidden_dim=m["hidden_dim"],
@@ -64,4 +68,5 @@ def model_from_config(cfg: dict, atom_ref: tuple | None = None) -> QM9Model:
         n_basis=m["rbf"]["n_basis"],
         cutoff=m["rbf"]["cutoff"],
         atom_ref=atom_ref,
+        radius_init=radius_init,
     )
