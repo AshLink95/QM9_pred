@@ -17,6 +17,7 @@ import numpy as np
 
 from data.electrons import centers_per_spin
 from data.parse_siesta import parse_fdf
+from model.heads import select_centers
 from model.model import model_from_config
 from training.train import load_config, load_params
 
@@ -31,9 +32,10 @@ def load_model(cfg, params_path, z0, pos0):
 
 def record_for(name, out, spins, z):
     """One JSON record: {input, energy, wannier:{spin:[{position, radius}, ...]}}.
-    Each spin's centers are its first k slots, k = valence electrons / 2 (data/electrons.py)."""
-    centers = np.asarray(out["wannier"]["centers"])
-    radii = np.asarray(out["wannier"]["radii"])
+    Each spin's centers are its k top-scoring candidates, k = valence electrons / 2
+    (data/electrons.py)."""
+    sel = select_centers(out["wannier"])
+    centers, radii = sel["centers"], sel["radii"]
     k = centers_per_spin(z, len(spins))
     wannier = {spin: [{"position": [round(float(v), 6) for v in centers[s, j]],
                        "radius": round(float(radii[s, j]), 6)} for j in range(k[s])]
@@ -86,8 +88,8 @@ def run_single(fdf_path, cfg, params_path):
     out = model.apply(params, z, pos)
 
     print(f"energy = {float(out['energy']):.4f} eV")
-    centers = np.asarray(out["wannier"]["centers"])
-    radii = np.asarray(out["wannier"]["radii"])
+    sel = select_centers(out["wannier"])
+    centers, radii = sel["centers"], sel["radii"]
     spins = cfg["wannier"]["spins"]
     k = centers_per_spin(z, len(spins))
     for s, spin in enumerate(spins):

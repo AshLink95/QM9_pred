@@ -20,8 +20,8 @@ def energy_mae(apply_fn, params, examples) -> float:
 def match_wannier(pred_c, pred_r, k, true_c, true_r):
     """Match one molecule's predicted centers (one spin) to its true centers.
 
-    pred_c[M,3], pred_r[M]: all slots from the Wannier head for this spin; the first k are the
-    predicted centers (k = Σ valence/2, data/electrons.py). true_c[K,3], true_r[K]: parsed .wout
+    pred_c[C,3], pred_r[C]: this spin's candidates ordered by `model.heads.select_centers`; the
+    first k are the predicted centers (k = Σ valence/2, data/electrons.py). true_c[K,3], true_r[K]: parsed .wout
     values. Returns {"pairs": [(true_idx, pred_idx, dist_A, radius_err_A)], "kept": [0..k-1],
     "n_true": K, "n_pred": k}. If k != K: min(K, k) pairs; the rest are missed/extra centers.
     """

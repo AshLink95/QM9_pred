@@ -179,43 +179,66 @@ param (lives in the checkpoint, so inference needs nothing extra); the `atom_ref
 only sets its *initial* value. Still a sum over atoms → invariant, permutation-invariant,
 size-extensive.
 
-### WannierHead (equivariant point set per spin)
-```python
-centroid = jnp.mean(x, axis=0)                       # [3]  equivariant
-A = _mlp(...)(h).reshape(N, S, M)                     # [N,S,M]  INVARIANT per-atom weights
-offsets = jnp.einsum("nsm,nd->smd", A, x - centroid)  # [S,M,3]
-centers = centroid + offsets                          # [S,M,3]  equivariant
-```
-- `S` = number of spin channels (2: up/down), `M` = `max_centers` slots per spin.
-- A center is the **centroid plus a weighted sum of atom offsets**, where the weights `A` come
-  from invariant `h`. Equivariance: `centroid` moves with the molecule, `x − centroid` is
-  translation-free and rotates with `R`, weights are invariant ⇒ `centers → R·centers (+t)`.
-  This is the §5 requirement "centers must come out of the equivariant track, never a raw MLP."
-- `jnp.einsum("nsm,nd->smd", A, V)` means: for each spin `s`, slot `m`, coordinate `d`, sum over
-  atoms `n` of `A[n,s,m] · V[n,d]`. It's the batched weighted sum in one call
-  ([primer §9](jax_flax_primer.md) for the index intuition).
+### WannierHead (equivariant point SET per spin, from per-atom candidates)
+
+**Why not one list of slots.** The first head built every center as one global slot,
+`center_m = centroid + Σ_i A[i,m]·(x_i − centroid)`, with weights `A` from `h`. That rotates
+correctly, but it has a hidden constraint. Take methane: its four hydrogens are indistinguishable
+(same distances ⇒ same `h` ⇒ same `A[i,m]`), and their offsets from the centroid sum to zero, so
+**every slot lands exactly on the carbon, whatever the weights** — checked with random weights.
+The true centers sit on the four C–H bonds, ≈ 0.65 Å away. In general: if a molecule maps onto
+itself under a rotation or mirror `g`, equivariance forces `f(X) = g·f(X)` *slot by slot*, so
+every slot must lie on every symmetry element (all slots in the plane of a planar molecule). The
+physics only needs the *set* of centers to map onto itself; individual centers may swap places
+(the C–H center of H1 becomes that of H2 under a 120° turn). On the test set this showed up as
+19 % of predicted centers piled within 0.3 Å of another (true: 0.06 %) and no out-of-plane centers
+in planar molecules (53 % of their true centers are ≈ 0.57 Å out of plane). Training can't fix a
+constraint of the architecture.
+
+**The fix: candidates belong to atoms.** When a symmetry swaps two atoms, their candidates swap
+too, so the output is a set that transforms with the molecule — deterministically and exactly
+(same molecule ⇒ same set, in any frame or atom order). Per atom `i` and spin `s`
+(`r_ij = (x_j − x_i)/(d_ij + 1)`, bounded like the EGNN coordinate update; every weight is an
+invariant function of `h_i, h_j, d_ij` from a small edge MLP):
 
 ```python
-rp = jnp.mean(_mlp(...)(h), axis=0).reshape(S, M)     # [S,M] invariant per-slot readout
-offset = self.param("radius_offset", ...)             # starts at softplus⁻¹(dataset mean radius)
-radii  = nn.softplus(rp + offset)                     # [S,M] > 0
+single:  c   = x_i + Σ_j α_ij r_ij              # K per atom (singles_per_atom, default 2)
+pair:    c±  = b_i ± s_i · (u_i × v_i)          # P per atom (pairs_per_atom, default 1)
+         u_i = Σ_j a_ij r_ij,  v_i = Σ_j β_ij r_ij,  b_i built like a single
 ```
-- `radii` are invariant scalars from `h`. The readout is a **mean** over atoms: a center's size
-  doesn't grow with the molecule (unlike energy, which is a **sum**).
-- `softplus` keeps radii positive. `radius_offset` is a trainable scalar that starts at the
-  inverse-softplus of the training set's mean radius (`radius_init`, set at training start like
-  `atom_ref`). The model therefore starts at the "constant guess" (0.05 Å error) instead of
-  arbitrary sizes.
-- **How many slots are real is not predicted.** Spin `s` has `k = Σ valence/2` centers
-  (`data/electrons.py`), and the first `k` slots of that spin are its centers. An earlier
-  presence score (sigmoid gate per slot) was removed: together with predicted widths in the loss,
-  it let the model blur several centers into a few faint blobs (CLAUDE.md §6 "Revised loss").
-- Spin up and spin down have separate slots (`S = 2`) and are never mixed.
+- Singles: an atom's own point(s), moved along its bonds. Each methane hydrogen gets its own.
+- Pairs: for centers above/below a mirror plane (double bonds, lone pairs of a planar molecule).
+  For an atom in the plane, `u` and `v` lie in the plane, so `u × v` is normal to it. `u × v` is
+  a *pseudovector*: under a reflection it flips sign, so the two members `c+` and `c−` swap — the
+  pair reflects exactly as a set, and no chirality is introduced (cf. CLAUDE.md §8).
+- `jnp.einsum("ijsq,ijd->isqd", a, r)`: for each atom `i`, spin `s`, candidate `q`, coordinate
+  `d`, sum over neighbors `j` of `a[i,j,s,q] · r[i,j,d]` ([primer §9](jax_flax_primer.md)).
+- Per candidate also an invariant **radius** (`softplus(· + radius_offset)`, the offset starting
+  at the training set's mean radius, so step 0 is the "constant guess", 0.05 Å) and an invariant
+  **selection logit**. A pair's two members share both (a symmetry may swap them).
+- Output per spin: `C = N·(K + 2P)` candidates (4 per atom by default) —
+  `{centers[S,C,3], radii[S,C], logits[S,C]}`; candidate `c` belongs to atom `c // (K+2P)`.
+- **Initialization:** single offsets start at zero (each candidate on its own atom); the `u, v`
+  weights and the pair spread start random — `u × v` has no gradient at `u = v = 0`, and a pair
+  that starts collapsed is never nearer to an off-plane target than an in-plane single, so it
+  would never be matched (seen in a one-molecule fit).
+- **Choosing the centers:** the count is still not predicted — spin `s` has `k = Σ valence/2`
+  centers (`data/electrons.py`). `select_centers` orders candidates by logit; the first `k` are
+  the prediction. Training teaches the logits ([losses](losses.md) §3). Every consumer
+  (validation, report, `main.py`) goes through `select_centers`.
+- **Known ceiling:** an atom on *two* mirror planes (the carbons of ethylene or benzene) can't
+  form any nonzero pseudovector there (the second mirror forces `u × v = 0`), so its pairs stay
+  collapsed; neighboring atoms with one mirror (the H's) can still host the off-plane pair. A
+  sign-free axis (rank-2 tensor) would lift this; CLAUDE.md §7 defers L ≥ 2. Most QM9 molecules
+  have at most one mirror.
+- Spin up and spin down have separate candidates (`S = 2`) and are never mixed. An earlier
+  *presence* amplitude inside the cloud loss let the model blur centers (CLAUDE.md §6); the
+  selection logit is trained by classification only and never enters an overlap.
 
 ## 6. `model.py` — assembly
 
 `QM9Model.__call__(z, pos)` = embed `z`→`h`, set `x=pos`, run `EGNNBackbone`, then both heads;
-returns `{"energy": scalar, "wannier": {centers[S,M,3], radii[S,M]}}`. `model_from_config(cfg,
+returns `{"energy": scalar, "wannier": {centers[S,C,3], radii[S,C], logits[S,C]}}`. `model_from_config(cfg,
 atom_ref=…, radius_init=…)` reads `configs/*.yaml` and constructs it — no magic numbers in code
 (CLAUDE.md §11). `atom_ref` and `radius_init` are only initial values, fitted from the train
 split at training start; inference loads the trained values from the checkpoint.
@@ -226,13 +249,14 @@ split at training start; inference loads the trained values from the checkpoint.
 | Symptom | Likely cause | Where |
 |---|---|---|
 | rotation test fails on centers | equivariant track polluted — `diff`/`pos` fed to `φ_e`/`h`, or `φ_x` not scalar | §2, §4 |
-| translation test fails | absolute `x` used instead of `x_i − x_j`, or head not built off `centroid` | §2, §5 |
+| translation test fails | absolute `x` used instead of `x_i − x_j`, or a candidate not anchored at `x_i` | §2, §5 |
 | energy changes under permutation | a non-sum aggregation crept in (e.g. indexing atom 0) | §2, §5 |
-| mirror test fails | you added a chiral feature (triple product / signed volume) | §4 |
+| mirror test fails | you added a chiral feature (triple product / signed volume), or a pair's members got different radii/logits | §4, §5 |
 | `NaN` early in training | remove the `+1e-12` in `sqrt`, or radius not passed through `softplus` | §2, §5 |
 | E-loss ~1e12, then NaN | energy offset missing — targets not referenced | §5 per-element reference |
 | W-loss explodes in one epoch | coordinate update unbounded (`tanh` / `/(d+1)` removed) | §2 |
-| centers all collapse to centroid | `A` weights vanish — check `hidden_dim`, learning rate | §5 |
+| predicted centers pile up / stay in the plane | a global (non per-atom) output crept back in | §5 |
+| off-plane pairs never used | pair spread zero-initialized, or whole-pair matching off | §5, [losses](losses.md) §3 |
 
 ## Rebuild-by-hand order
 1. `ElementEmbedding` (§1) → get `h` from `z`.
@@ -240,6 +264,6 @@ split at training start; inference loads the trained values from the checkpoint.
    scalar-weighted coord update. **Test equivariance now on random weights** ([symmetry](symmetry.md)).
 3. Stack into `EGNNBackbone`.
 4. `EnergyHead` (sum of per-atom scalars) → train energy-only first.
-5. `WannierHead` (centroid + einsum offsets per spin; mean-pooled softplus radius starting
-   at the dataset mean; no presence: the count comes from `data/electrons.py`).
+5. `WannierHead` (per-atom singles + ± pairs per spin, radius and logit per candidate; the
+   count comes from `data/electrons.py`, `select_centers` picks the top k).
 6. Wire in `model.py`, drive hyperparameters from config.

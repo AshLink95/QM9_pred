@@ -33,6 +33,7 @@ code alone. Commands for running everything are in the top-level [README](../REA
     lock-free queue, dead-job recovery, the two-stage plan, reading `status`.
 11. **[symmetry.md](symmetry.md)** — the transforms and the equivariance tests (the correctness
     claim).
+12. **[refs.md](refs.md)** — every academic source the project uses, and what for.
 
 ## The pipeline, end to end
 
@@ -46,7 +47,7 @@ code alone. Commands for running everything are in the top-level [README](../REA
                                   EGNNBackbone (h invariant, x equivariant)
                                              │
                               ┌──────────────┴──────────────┐
-                        EnergyHead (Σ scalars)        WannierHead (equivariant point set)
+                        EnergyHead (Σ scalars)        WannierHead (per-atom candidates → set)
                                              │
                                              ▼                 losses/
               λ_E·energy MSE + λ_W·(matched positions + radii + fixed-width guide), per spin
@@ -94,7 +95,8 @@ interface — neither side reaches across.
 - **`tests/`** — `test_parsers.py`, `test_equivariance.py` (the gate — see
   [symmetry](symmetry.md)), `test_loss.py`, `test_training_smoke.py`, `test_metrics.py` +
   `test_report.py` (accuracy report), `test_electrons.py` (center count per spin) +
-  `test_wannier_match.py` (the matched Wannier loss). Run `uv run pytest -q`.
+  `test_wannier_match.py` (the matched Wannier loss) + `test_set_head.py` (what the per-atom
+  candidate head can represent). Run `uv run pytest -q`.
 
 ## If you rebuild from scratch
 Follow the build order in `../CLAUDE.md §10`; each doc ends with a "Rebuild-by-hand" section for

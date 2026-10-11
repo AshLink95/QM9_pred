@@ -198,3 +198,4 @@ The model guarantees all of these by construction, not by hoping it learns them.
   *Scientific Data* 1, 140022 (2014) — the QM9 dataset.
 - Zhang et al., "Deep neural network for the dielectric response of insulators",
   *Phys. Rev. B* 102, 041121 (2020) — ML prediction of Wannier centroids.
+- Full bibliography with what each source is used for: [refs](refs.md).

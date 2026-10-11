@@ -4,7 +4,7 @@ Used by `scripts/evaluate.py`. Pure evaluation — nothing here is imported by t
 
 Pipeline: examples (from dataset.pkl or freshly parsed folders) -> `predict_all` (batched
 forward pass) -> `build_report` (per-molecule + per-center rows, summary numbers via
-training/metrics.py) -> `write_outputs` (CSV logs, summary.txt, accuracy.png).
+training/metrics.py) -> `write_outputs` (CSV logs, summary.txt, plots/*.png).
 """
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ from pathlib import Path
 
 import jax
 import numpy as np
-from flax import serialization
 
 from data.dataset import _index, _mol_id, load_molecule
 from data.electrons import centers_per_spin
 from symmetry import transforms as T
+from model.heads import select_centers
 from training.metrics import match_wannier, wannier_summary
 
 _SYMBOL = {1: "H", 6: "C", 7: "N", 8: "O", 9: "F", 15: "P", 16: "S", 17: "Cl"}
@@ -62,13 +62,6 @@ def load_fresh(dirs, spins):
     return examples, skipped
 
 
-def max_centers_from_checkpoint(params_path, n_spins) -> int:
-    """Wannier slot count baked into a checkpoint (the head's output width / n_spins), so the
-    model is rebuilt with the shapes it was trained with regardless of the eval data."""
-    raw = serialization.msgpack_restore(Path(params_path).read_bytes())
-    return int(raw["params"]["WannierHead_0"]["w1"]["kernel"].shape[1]) // n_spins
-
-
 # ------------------------------------------------------------------------ prediction
 def predict_all(model, params, examples, batch_size=256):
     """Forward pass over all examples, batched by atom count; returns per-example outputs in
@@ -86,7 +79,7 @@ def predict_all(model, params, examples, batch_size=256):
             res = jax.device_get(fwd(params,
                                      np.stack([examples[i]["z"] for i in padded]),
                                      np.stack([examples[i]["pos"] for i in padded])))
-            w = res["wannier"]
+            w = select_centers(res["wannier"])         # k top-scoring candidates first
             for j, i in enumerate(chunk):
                 out[i] = {"energy": float(res["energy"][j]), "centers": w["centers"][j],
                           "radii": w["radii"][j]}
@@ -99,9 +92,9 @@ def rotation_drift(model, params, ex):
     base = model.apply(params, z, pos)
     R = T.random_rotation(seed=0)
     rot = model.apply(params, z, T.rotate(pos, R))
+    bc, rc = select_centers(base["wannier"])["centers"], select_centers(rot["wannier"])["centers"]
     return (abs(float(rot["energy"]) - float(base["energy"])),
-            float(np.max(np.abs(np.asarray(rot["wannier"]["centers"])
-                                - np.asarray(base["wannier"]["centers"]) @ R.T))))
+            float(np.max(np.abs(rc - bc @ R.T))))
 
 
 # ------------------------------------------------------------------------ comparison
@@ -216,11 +209,11 @@ def write_outputs(out_dir, mol_rows, center_rows, summary_text, data, spins):
                 w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
                 w.writeheader(); w.writerows(rows)
     (out / "summary.txt").write_text(summary_text + "\n")
-    _figure(out / "accuracy.png", data, spins)
+    _figures(out, data)
 
 
 # ------------------------------------------------------------------------ figure
-# Colors: validated categorical slots 1-2 (spin up / down), sequential blue ramp for density,
+# Colors: validated categorical series color, sequential blue ramp for density,
 # recessive chrome — from the dataviz reference palette (light surface).
 _SERIES = ["#2a78d6", "#eb6834"]
 _SEQ = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"]
@@ -253,19 +246,37 @@ def _beyond(n, unit_lim):
     return f"   ({n} beyond {unit_lim} not shown)" if n else ""
 
 
-def _figure(path, data, spins):
+PLOTS = ("energy_error_vs_energy.png", "energy_error_hist.png", "center_error_hist.png",
+         "radius_parity.png", "molecule_center_error_hist.png")
+
+
+def _figures(out_dir, data):
+    """One PNG per plot in <out_dir>/plots/ (PLOTS). Spin up and down are pooled: they agree to
+    a few mÅ, and the per-spin numbers are in summary.txt and the CSVs. No count plot: the count
+    is computed (valence / 2), so it would always read "+0"; count accuracy is in summary.txt."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap, LogNorm
 
+    out = Path(out_dir) / "plots"
+    out.mkdir(parents=True, exist_ok=True)
     seq = LinearSegmentedColormap.from_list("seq_blue", _SEQ)
-    fig, axs = plt.subplots(2, 3, figsize=(16, 9.5), facecolor=_SURF)
+
+    def new():
+        return plt.subplots(figsize=(6.5, 4.8), facecolor=_SURF)
+
+    def save(fig, name):
+        fig.tight_layout()
+        fig.savefig(out / name, dpi=150, facecolor=_SURF)
+        plt.close(fig)
+
     et, ep = data["e_true"], data["e_pred"]
     err = ep - et
+    matches = [m for ms in data["by_spin"].values() for m in ms]
 
-    # 1. energy error vs energy (a parity plot hides eV-scale errors on a ~1e3 eV axis)
-    ax, note = axs[0, 0], ""
+    # energy error vs energy (a parity plot hides eV-scale errors on a ~1e3 eV axis)
+    fig, ax = new(); note = ""
     if len(et):
         lim = np.percentile(np.abs(err), 99.5) or 1.0
         keep = np.abs(err) <= lim
@@ -276,9 +287,10 @@ def _figure(path, data, spins):
         note = _beyond(int((~keep).sum()), f"±{lim:.3g} eV")
     _style(ax, "Energy error vs SIESTA energy", "SIESTA total energy (eV)" + note,
            "predicted − SIESTA (eV)")
+    save(fig, PLOTS[0])
 
-    # 2. energy error histogram
-    ax, note = axs[0, 1], ""
+    # energy error histogram
+    fig, ax = new(); note = ""
     if len(err):
         lim = np.percentile(np.abs(err), 99.5) or 1.0
         ax.hist(err, bins=80, range=(-lim, lim), color=_SERIES[0], edgecolor=_SURF,
@@ -288,40 +300,21 @@ def _figure(path, data, spins):
                 transform=ax.transAxes, va="top", color=_INK2, fontsize=9)
         note = _beyond(int((np.abs(err) > lim).sum()), f"±{lim:.3g} eV")
     _style(ax, "Energy error (predicted − SIESTA)", "error (eV)" + note, "molecules")
+    save(fig, PLOTS[1])
 
-    dists = {sp: np.array([p[2] for m in data["by_spin"][sp] for p in m["pairs"]])
-             for sp in spins}
-    # 3. center distance histogram per spin
-    ax, note = axs[0, 2], ""
-    alld = np.concatenate([d for d in dists.values() if len(d)] or [np.zeros(0)])
-    if len(alld):
-        top = np.percentile(alld, 99.5) or 1.0
-        for k, sp in enumerate(spins):
-            if len(dists[sp]):
-                ax.hist(dists[sp], bins=80, range=(0, top), histtype="step", linewidth=2,
-                        color=_SERIES[k], label=f"spin {sp}  (MAE {dists[sp].mean():.4f} Å)")
-        ax.legend(frameon=False, fontsize=9, labelcolor=_INK2)
-        note = _beyond(int((alld > top).sum()), f"{top:.3g} Å")
-    _style(ax, "Wannier center error (matched pairs)", "distance to true center (Å)" + note,
-           "centers")
+    # matched center distances, both spins
+    fig, ax = new(); note = ""; title = "Wannier center error (matched)"
+    d = np.array([p[2] for m in matches for p in m["pairs"]])
+    if len(d):
+        top = np.percentile(d, 99.5) or 1.0
+        ax.hist(d, bins=80, range=(0, top), color=_SERIES[0], edgecolor=_SURF, linewidth=0.5)
+        title += f"  (MAE {d.mean():.4f} Å)"
+        note = _beyond(int((d > top).sum()), f"{top:.3g} Å")
+    _style(ax, title, "distance to true center (Å)" + note, "centers")
+    save(fig, PLOTS[2])
 
-    # 4. count error per spin (grouped bars)
-    ax = axs[1, 0]
-    errs = {sp: Counter(m["n_pred"] - m["n_true"] for m in data["by_spin"][sp]) for sp in spins}
-    keys = sorted(set().union(*errs.values())) if errs else []
-    width = 0.8 / max(len(spins), 1)
-    for k, sp in enumerate(spins):
-        x = np.arange(len(keys)) + (k - (len(spins) - 1) / 2) * width
-        ax.bar(x, [errs[sp].get(c, 0) for c in keys], width=width, color=_SERIES[k],
-               edgecolor=_SURF, linewidth=2, label=f"spin {sp}")
-    ax.set_xticks(np.arange(len(keys)), [f"{c:+d}" for c in keys])
-    if keys:
-        ax.legend(frameon=False, fontsize=9, labelcolor=_INK2)
-    _style(ax, "Center count error per molecule", "predicted − true count",
-           "molecules")
-
-    # 5. radius parity on matched pairs
-    ax = axs[1, 1]
+    # radius parity on matched pairs
+    fig, ax = new()
     tr, prr = data["radii_true"], data["radii_pred"]
     if len(tr):
         hb = ax.hexbin(tr, prr, gridsize=50, cmap=seq, mincnt=1, norm=LogNorm(), linewidths=0)
@@ -330,14 +323,15 @@ def _figure(path, data, spins):
         _cbar(fig, hb, ax, "centers per cell")
     _style(ax, "Wannier radius: predicted vs true (matched)", "true radius (Å)",
            "predicted radius (Å)")
+    save(fig, PLOTS[3])
 
-    # 6. per-molecule center MAE (both spins pooled)
-    ax, note, title = axs[1, 2], "", "Per-molecule mean center error"
+    # per-molecule mean center error (both spins)
+    fig, ax = new(); note = ""; title = "Per-molecule mean center error"
     per_mol = []
-    for ms in zip(*[data["by_spin"][sp] for sp in spins]):
-        d = [p[2] for m in ms for p in m["pairs"]]
-        if d:
-            per_mol.append(np.mean(d))
+    for ms in zip(*data["by_spin"].values()):
+        dm = [p[2] for m in ms for p in m["pairs"]]
+        if dm:
+            per_mol.append(np.mean(dm))
     if per_mol:
         per_mol = np.array(per_mol)
         top = np.percentile(per_mol, 99.5) or 1.0
@@ -346,16 +340,13 @@ def _figure(path, data, spins):
         title += f"  (median {np.median(per_mol):.4f} Å)"
         note = _beyond(int((per_mol > top).sum()), f"{top:.3g} Å")
     _style(ax, title, "mean distance (Å)" + note, "molecules")
-
-    fig.tight_layout()
-    fig.savefig(path, dpi=130, facecolor=_SURF)
-    plt.close(fig)
+    save(fig, PLOTS[4])
 
 
 # ------------------------------------------------------------------ one-call evaluation
 def evaluate_checkpoint(cfg, params_path, out_dir, *, examples=None, dataset_path=None,
                         subset="test", data_dir=None, batch_size=256):
-    """Score a checkpoint and write the report (CSVs, summary.txt, accuracy.png) to `out_dir`.
+    """Score a checkpoint and write the report (CSVs, summary.txt, plots/*.png) to `out_dir`.
 
     Molecules come from `data_dir` (fresh folders, parsed here), else from `examples` (already
     loaded) or `dataset_path`, restricted to `subset` of the training split (split_seed from
@@ -366,8 +357,6 @@ def evaluate_checkpoint(cfg, params_path, out_dir, *, examples=None, dataset_pat
     from training.train import load_params, split_seed
 
     spins = cfg["wannier"]["spins"]
-    cfg = {**cfg, "wannier": {**cfg["wannier"],
-                              "max_centers": max_centers_from_checkpoint(params_path, len(spins))}}
     header, skipped = [], []
     if data_dir:
         examples, skipped = load_fresh(data_dir, spins)

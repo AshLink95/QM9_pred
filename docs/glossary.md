@@ -6,7 +6,6 @@ explanations: [physics_primer](physics_primer.md), [ml_primer](ml_primer.md),
 
 | Term | Meaning |
 |---|---|
-| **`.fdf` / `.out` / `.wout`** | SIESTA input (atoms), SIESTA log (energy), Wannier90 log (centers + spreads, one per spin). |
 | **Adam** | The optimizer (step rule) used for training; adapts the step size per parameter. |
 | **All-reduce** | Combining (summing) a value across all GPUs so each ends up with the total; used for gradients in multi-GPU training. |
 | **Assignment problem** | Pair the items of two equal-size sets so the total cost is minimal; solved by the Hungarian algorithm. |
@@ -18,6 +17,7 @@ explanations: [physics_primer](physics_primer.md), [ml_primer](ml_primer.md),
 | **Best / last checkpoint** | `params.msgpack` = parameters of the best validation epoch (used for evaluation); `params.last.msgpack` = full state for resuming. |
 | **Bohr** | Atomic length unit, 0.529 Å. Appears only in parts of SIESTA's `.out` that we don't use. |
 | **Bucket** | All training molecules with the same number of atoms; batches are cut from buckets. |
+| **Candidate** | One proposed Wannier center: each atom proposes a few per spin (singles and ± pairs); the k with the highest selection logits are the prediction. |
 | **Checkpoint** | Saved model parameters (`params.msgpack`); training resumes from it. |
 | **Chemical accuracy** | 1 kcal/mol ≈ 0.043 eV: the error level considered good for energy predictions. |
 | **Chiral** | A molecule that differs from its mirror image. |
@@ -39,8 +39,9 @@ explanations: [physics_primer](physics_primer.md), [ml_primer](ml_primer.md),
 | **Epoch** | One pass over all training molecules. |
 | **Equivariant** | Transforms *with* the input: rotate the molecule and the Wannier centers rotate the same way. |
 | **eV (electron-volt)** | The energy unit used throughout. |
-| **Gradient** | How much the loss changes per small change of each parameter; computed automatically by JAX. |
+| **`.fdf` / `.out` / `.wout`** | SIESTA input (atoms), SIESTA log (energy), Wannier90 log (centers + spreads, one per spin). |
 | **Gradient clipping** | Scaling down unusually large gradients to keep training stable. |
+| **Gradient** | How much the loss changes per small change of each parameter; computed automatically by JAX. |
 | **Graph neural network (GNN)** | A network that works on a graph by passing messages between connected nodes. |
 | **Guide term** | The fixed-width Gaussian-cloud part of the Wannier loss; smooth, needs no pairing. |
 | **Heartbeat** | A running sweep job touches its run's marker file every 60 s, so others can tell it's alive. |
@@ -62,18 +63,22 @@ explanations: [physics_primer](physics_primer.md), [ml_primer](ml_primer.md),
 | **Objective (validation)** | The number that picks the best epoch: energy MSE plus the matched Wannier position and radius terms on validation molecules (lower is better). |
 | **Open-shell** | Unpaired electrons (odd electron count); not supported. |
 | **Overfitting / underfitting** | Memorizing the training set vs. not fitting it well enough. |
+| **± pair** | Two candidates `b ± s·(u × v)` placed symmetrically about an atom's local plane, for centers above/below a flat molecule; always used together. |
 | **Parameters (weights)** | The adjustable numbers inside the network. |
 | **Patience** | How many validation checks in a row may pass without a new best before early stopping (`train.patience`; 0 = off). |
 | **Promotion (stage 2)** | When screening is done, the best stage-1 run is re-run as `final` with a long schedule; created exactly once. |
 | **Pseudopotential** | Replaces a nucleus + its core electrons with an effective potential, so only valence electrons are simulated. |
+| **Pseudovector** | A vector that flips sign under a reflection, like a cross product `u × v`; used for the ± pairs, whose two members a mirror swaps. |
 | **Radius (of a Wannier function)** | √spread, in Å; the size of the orbital. Typical 0.74–0.97 Å. |
 | **Readout** | The final step turning per-atom features into outputs (e.g. summing per-atom energies). |
 | **Residual connection** | A layer adds a change to its input (`h = h + update`) instead of replacing it. |
 | **SCF step** | One iteration of the self-consistent DFT loop; SIESTA prints an energy for each. |
 | **Schedule (learning rate)** | How the learning rate changes over training (`train.lr_schedule`). |
 | **Seed** | Number that fixes the randomness (initial weights, batch order). `train.seed`; different seeds measure run-to-run noise. |
+| **Selection logit** | A candidate's score; trained as yes/no (did the matching choose it?). `select_centers` ranks by it. The count k is still computed, not learned. |
+| **Self-symmetry** | A rotation or mirror that maps a molecule onto itself (methane under a 120° turn). An equivariant model's output must keep it, which is why outputs are a set of per-atom candidates rather than a list of slots. |
 | **SIESTA** | The DFT program that produced the training data (`.fdf` input, `.out` log). |
-| **Slot** | One of the fixed 28 outputs per spin of the Wannier head; the first k are the predicted centers. |
+| **Slot** | The old Wannier head's fixed outputs per spin (replaced by per-atom candidates: global slots collapse onto a molecule's symmetry axes). |
 | **Spin (up/down)** | An electron property with two values; each spin has its own Wannier set and `.wout` file. |
 | **Spin-polarized** | A calculation that treats spin-up and spin-down electrons separately. |
 | **Split (train/val/test)** | The fixed 80/10/10 division of molecules: learn / monitor / final score. |

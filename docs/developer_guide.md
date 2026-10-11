@@ -19,7 +19,7 @@ how to debug. Commands for running everything are in the top-level [README](../R
 | `data/units.py` | Å / Bohr / eV / Ry conversions | no |
 | `model/embeddings.py` | element → feature vector | **yes** |
 | `model/egnn.py` | the message-passing layers (the symmetry-preserving core) | **yes** |
-| `model/heads.py` | energy readout + Wannier slots (centers, radii) per spin | **yes** |
+| `model/heads.py` | energy readout + per-atom Wannier candidates (center, radius, selection logit) per spin; `select_centers` | **yes** |
 | `model/model.py` | assembles everything into `QM9Model`; `model_from_config` | **yes** |
 | `losses/wannier_match.py` | the Wannier loss: Hungarian-matched positions + radii + fixed-width guide, per spin | — |
 | `losses/wannier_cloud.py` | closed-form Gaussian-cloud overlap (the guide term) | — |
@@ -70,7 +70,7 @@ uv run pytest -q                          # should print "N passed"
    whole sweep with `scripts/train-bunch.sh` submitted from several jobs
    ([sweeps](sweeps.md)). Watch the log: per-epoch loss terms, validation line, `* new best`.
 4. **Evaluate** with `scripts/evaluate.py` on the test split; read `summary.txt` and
-   `accuracy.png`.
+   the images in `plots/`.
 5. **Compare** with the previous model's report (keep old `params.msgpack` files under a new
    name, e.g. `params_v1.msgpack`, and old `accuracy_report/` folders).
 6. **Record** design changes in `CLAUDE.md` and the matching `docs/` page.
@@ -83,7 +83,7 @@ Don't run full training on a laptop or shared login node: it takes ~1 hour on a 
 |---|---|---|
 | Messages in `EGNNLayer` use only invariants (element features, distances) | otherwise rotation/translation symmetry breaks | [model](model.md) §4 "do NOT alter" |
 | Positions are only updated by relative vectors × plain numbers | same | [model](model.md) §2 |
-| Wannier centers are built from the equivariant track (`centroid + Σ A·(x − centroid)`) | an ordinary MLP output can't rotate with the molecule | [model](model.md) §5 |
+| Wannier candidates are built per atom from the equivariant track (`x_i + Σ_j α_ij r_ij`, ± pairs via `u × v`) | an ordinary MLP output can't rotate with the molecule; global slots collapse onto symmetry axes | [model](model.md) §5 |
 | Energy is a **sum** over atoms | energy must scale with molecule size | [model](model.md) §5 |
 | The Wannier count is computed, never predicted; loss widths are fixed, never predicted | a model that controls these "games" the loss (measured) | [losses](losses.md) §2–3 |
 | Spins are never mixed in any loss or metric | up and down are separate physical sets | [losses](losses.md) §3 |
@@ -177,7 +177,8 @@ Keep both checkpoints and run `scripts.evaluate` for each with its own `--out-di
 | `test_equivariance.py` | **the symmetry guarantee** (rotate, translate, permute, mirror) on an untrained model |
 | `test_parsers.py` | `.fdf` / `.out` / `.wout` parsing on small synthetic files |
 | `test_electrons.py` | center count per spin; errors on unknown elements / odd electron counts |
-| `test_wannier_match.py` | the Wannier loss: zero on a reordered truth, known offsets, spin separation, gradients |
+| `test_wannier_match.py` | the Wannier loss: zero on a reordered truth, known offsets, spin separation, more candidates than centers, selection target, pairs used whole, gradients |
+| `test_set_head.py` | the head can reach what global slots couldn't: methane's 4 C–H centers, off-plane centers of a planar molecule (one-molecule fits) |
 | `test_loss.py` | the Gaussian-cloud overlap |
 | `test_metrics.py` | the evaluation matching metric |
 | `test_training_smoke.py` | the training loop runs and reduces error on fake molecules |

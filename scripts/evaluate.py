@@ -34,7 +34,7 @@ def main():
                                   dataset_path=args.dataset, subset=args.subset,
                                   data_dir=args.data_dir, batch_size=args.batch_size)
     print(text)
-    print(f"\nwrote {args.out_dir}/: molecules.csv, centers.csv, summary.txt, accuracy.png")
+    print(f"\nwrote {args.out_dir}/: molecules.csv, centers.csv, summary.txt, plots/*.png")
 
 
 if __name__ == "__main__":

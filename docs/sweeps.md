@@ -101,6 +101,19 @@ molecules never influence any choice.
 
 All runs share `split_seed: 0`, so all are scored on the **same test molecules**.
 
+**Current plan: `wannier_v3`** (the per-atom candidate head, [model](model.md) §5). Base = the v2
+winner's resolved config, `runs/wannier_v2/final/config.yaml`:
+
+| Runs | What changes | Question it answers |
+|---|---|---|
+| `base_s0`, `base_s1` | seed 0 / 1 | Run-to-run spread with the new head |
+| `select_w0.3`, `select_w3` | `wannier.select_weight` (base 1) | How hard to push candidate selection |
+| `singles3` | `wannier.singles_per_atom` 3 (base 2) | Do atoms need more candidates? |
+| `pairs2` | `wannier.pairs_per_atom` 2 (base 1) | More ± pairs per atom (several off-plane centers on one atom)? |
+
+**Previous plan: `wannier_v2`** (global-slot head, finished; results in `runs/wannier_v2/`; the
+winner's `final` reached test energy 0.058 eV, radius 0.022 Å, centers 0.36 Å):
+
 | Runs | What changes | Question it answers |
 |---|---|---|
 | `base_s0`, `base_s1`, `base_s2` | seed 0 / 1 / 2 | How much do results vary by chance alone? Differences smaller than this spread aren't real. |

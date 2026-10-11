@@ -21,3 +21,6 @@ accuracy_report/
 *.msgpack
 *.best.json
 *.progress.json
+
+# Misc.
+*.png

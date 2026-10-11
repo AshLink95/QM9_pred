@@ -6,7 +6,8 @@ import numpy as np
 from data.electrons import centers_per_spin
 
 WANNIER_CFG = {"max_centers": 10, "spins": ["up", "down"],
-               "guide_sigma": 0.3, "radius_weight": 1.0, "guide_weight": 0.1}
+               "guide_sigma": 0.3, "radius_weight": 1.0, "guide_weight": 0.1,
+               "select_weight": 1.0, "singles_per_atom": 2, "pairs_per_atom": 1}
 
 
 def molecules(n, seed=0):

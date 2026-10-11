@@ -121,14 +121,14 @@ once, pairs centers on the host, and computes:
 
 | Value | Meaning |
 |---|---|
-| **val objective** | `λ_E · energy MSE + λ_W · (matched position MSE + radius_weight · normalized radius MSE)`: the training loss minus the guide term (the guide is only a training aid). **Lower = better; this picks the best epoch.** |
+| **val objective** | `λ_E · energy MSE + λ_W · (matched position MSE + radius_weight · normalized radius MSE)`, computed on the **selected** centers (the k top-scoring candidates per spin, as at prediction time), without the guide and selection terms (training aids). **Lower = better; this picks the best epoch.** |
 | `E-MAE` | validation energy error, eV |
 | `center up/down` | per-spin matched center error, Å |
 | `radius` | matched radius error, Å |
 
 The line looks like:
 ```
-epoch   40  lr 9.71e-04  train 0.4123 (E 0.0210  W 0.3913 = pos 0.3101 A^2, radius 0.6012, guide 0.2210) | val obj 0.3811  E-MAE 0.1512 eV  center up/down 0.2101/0.2098 A  radius 0.0412 A  * new best  (63.2s)
+epoch   40  lr 9.71e-04  train 0.4123 (E 0.0210  W 0.3913 = pos 0.3101 A^2, radius 0.6012, select 0.0950, guide 0.2210) | val obj 0.3811  E-MAE 0.1512 eV  center up/down 0.2101/0.2098 A  radius 0.0412 A  * new best  (63.2s)
 ```
 - `* new best`: the validation objective improved, so the parameters are saved as the best.
 - **Early stopping** (`train.patience`, 0 = off): after `patience` validations in a row without
@@ -169,14 +169,15 @@ and resubmission. Set `JAX_COMPILATION_CACHE_DIR=` (empty) to disable.
 
 ## 9. Evaluation code
 
-- **`metrics.py:match_wannier`** scores one molecule and spin: the first `k` slots are matched
-  one-to-one to the true centers (`scipy.optimize.linear_sum_assignment`), returning per-pair
+- **`metrics.py:match_wannier`** scores one molecule and spin: the first `k` candidates after
+  `model.heads.select_centers` (highest logits first) are matched one-to-one to the true centers (`scipy.optimize.linear_sum_assignment`), returning per-pair
   distance (Å), radius error, and both counts. `wannier_summary` aggregates MAE / RMSE /
   median / p95 / radius MAE / count accuracy.
 - **`report.py:evaluate_checkpoint`** is the whole accuracy report in one call (used by
   `scripts/evaluate.py` and by the sweep after each run): load the checkpoint, pick the molecules
   (test split by `split_seed`, or fresh folders), predict in batches (`predict_all`), compare
-  (`build_report`), write CSVs, `summary.txt`, `accuracy.png`.
+  (`build_report`), write CSVs, `summary.txt`, and one PNG per plot in `plots/` (`PLOTS`; spins
+  pooled, no count plot since the count is computed).
 
 ---
 

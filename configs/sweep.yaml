@@ -2,8 +2,11 @@
 # from this list until none are left. Editing this file later only ADDS new runs; existing runs
 # (by name) are never duplicated or changed.
 
-name: wannier_v2                # runs are written to runs/<name>/
-base: configs/gpu.yaml          # every run starts from this config
+# v3: the per-atom candidate Wannier head (model/heads.py). v2 (global slots) finished; its runs
+# stay in runs/wannier_v2/ and its plan is in git history.
+name: wannier_v3                # runs are written to runs/<name>/
+base: runs/wannier_v2/final/config.yaml   # the v2 winner's resolved config (configs/gpu.yaml if
+                                          # you don't have it); new head keys use their defaults
 dataset: dataset.pkl            # read-only, shared by all runs
 stale_minutes: 30               # no-heartbeat fallback when squeue can't tell if an owner died
 
@@ -22,14 +25,7 @@ stage2_overrides:
 runs:
   - {name: base_s0, overrides: {train.seed: 0}}
   - {name: base_s1, overrides: {train.seed: 1}}
-  - {name: base_s2, overrides: {train.seed: 2}}
-  - {name: guide_w0.03, overrides: {wannier.guide_weight: 0.03}}   # less smooth guidance
-  - {name: guide_w0.3, overrides: {wannier.guide_weight: 0.3}}     # more smooth guidance
-  - {name: guide_s0.2, overrides: {wannier.guide_sigma: 0.2}}      # sharper guide
-  - {name: guide_s0.5, overrides: {wannier.guide_sigma: 0.5}}      # smoother guide
-  - {name: radius_w0.3, overrides: {wannier.radius_weight: 0.3}}   # favor positions
-  - {name: radius_w3, overrides: {wannier.radius_weight: 3.0}}     # favor radii
-  - {name: wannier_l0.3, overrides: {loss.lambda_wannier: 0.3}}    # favor energy
-  - {name: wannier_l3, overrides: {loss.lambda_wannier: 3.0}}      # favor Wannier
-  - {name: lr_5e-4, overrides: {train.lr: 5.0e-4}}                 # gentler steps
-  - {name: big_model, overrides: {model.hidden_dim: 192, model.n_layers: 6}}   # more capacity
+  - {name: select_w0.3, overrides: {wannier.select_weight: 0.3}}   # weaker candidate selection
+  - {name: select_w3, overrides: {wannier.select_weight: 3.0}}     # stronger candidate selection
+  - {name: singles3, overrides: {wannier.singles_per_atom: 3}}     # more candidates per atom
+  - {name: pairs2, overrides: {wannier.pairs_per_atom: 2}}         # more ± pairs per atom

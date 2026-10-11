@@ -48,7 +48,7 @@ def test_report_outputs(tmp_path):
     mol, cen, summary, data = R.build_report(ex, preds, [f"m{i}" for i in range(len(ex))],
                                              ["up", "down"])
     R.write_outputs(tmp_path, mol, cen, R.format_summary(summary), data, ["up", "down"])
-    for f in ("molecules.csv", "centers.csv", "summary.txt", "accuracy.png"):
+    for f in ("molecules.csv", "centers.csv", "summary.txt", *(f"plots/{p}" for p in R.PLOTS)):
         assert (tmp_path / f).stat().st_size > 0
     rows = list(csv.DictReader(open(tmp_path / "molecules.csv")))
     assert [r["molecule"] for r in rows] == [f"m{i}" for i in range(len(ex))]
@@ -95,7 +95,6 @@ def test_cli_default_test_split(tmp_path, monkeypatch, capsys):
     (tmp_path / "cfg.yaml").write_text(yaml.safe_dump(CFG))
     _, params = _model_params(ex)
     save_params(tmp_path / "p.msgpack", params)
-    assert R.max_centers_from_checkpoint(tmp_path / "p.msgpack", 2) == 10
 
     from scripts import evaluate
     monkeypatch.setattr(sys, "argv", [
@@ -105,4 +104,4 @@ def test_cli_default_test_split(tmp_path, monkeypatch, capsys):
     evaluate.main()
     out = capsys.readouterr().out
     assert "subset 'test'  ->  3 molecules" in out              # 25% of 12
-    assert (tmp_path / "rep" / "accuracy.png").exists()
+    assert all((tmp_path / "rep" / "plots" / p).exists() for p in R.PLOTS)

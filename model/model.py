@@ -19,8 +19,9 @@ class QM9Model(nn.Module):
     hidden_dim: int
     n_layers: int
     n_elements: int
-    max_centers: int
     n_spins: int
+    singles_per_atom: int = 2       # Wannier candidates per atom and spin (model/heads.py)
+    pairs_per_atom: int = 1         # ± candidate pairs per atom and spin
     rbf_enabled: bool = True
     n_basis: int = 16
     cutoff: float = 10.0
@@ -47,7 +48,8 @@ class QM9Model(nn.Module):
         e_ref = jnp.sum(nn.Embed(self.n_elements, 1, embedding_init=ref_init,
                                  name="atom_ref")(z))
         energy = EnergyHead(self.hidden_dim)(h) + e_ref
-        wannier = WannierHead(self.hidden_dim, self.max_centers, self.n_spins,
+        wannier = WannierHead(self.hidden_dim, self.n_spins, self.singles_per_atom,
+                              self.pairs_per_atom, self.rbf_enabled, self.n_basis, self.cutoff,
                               self.radius_init)(h, x)
         return {"energy": energy, "wannier": wannier}
 
@@ -57,13 +59,14 @@ def model_from_config(cfg: dict, atom_ref: tuple | None = None,
     """Build QM9Model from a parsed config dict (configs/*.yaml). `atom_ref` and `radius_init`
     (training only) set initial values fitted from the training set; inference loads the
     trained values from the checkpoint."""
-    m = cfg["model"]
+    m, w = cfg["model"], cfg["wannier"]
     return QM9Model(
         hidden_dim=m["hidden_dim"],
         n_layers=m["n_layers"],
         n_elements=m["n_elements"],
-        max_centers=cfg["wannier"]["max_centers"],
-        n_spins=len(cfg["wannier"]["spins"]),
+        n_spins=len(w["spins"]),
+        singles_per_atom=w.get("singles_per_atom", 2),
+        pairs_per_atom=w.get("pairs_per_atom", 1),
         rbf_enabled=m["rbf"]["enabled"],
         n_basis=m["rbf"]["n_basis"],
         cutoff=m["rbf"]["cutoff"],

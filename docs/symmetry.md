@@ -48,12 +48,15 @@ prediction:
 |---|---|---|
 | `test_translation` | energy unchanged; `centers_out == centers + t` | translation equivariance |
 | `test_rotation` | energy unchanged; `centers_out == centers @ Rᵀ`; radii unchanged | rotation equivariance |
-| `test_permutation` | energy unchanged; center **set** unchanged (compared via `np.sort`) | atom-order invariance |
-| `test_mirror` | energy unchanged; `centers_out == centers @ Mᵀ` | reflection equivariance |
+| `test_permutation` | energy unchanged; candidates, radii, logits permuted **with their atoms** | atom-order invariance of the set |
+| `test_mirror` | energy unchanged; singles `== centers @ Mᵀ`; each ± pair reflects with its two members **swapped**; radii/logits unchanged | reflection equivariance |
+| `test_selected_set_same_in_every_frame` | the k selected centers of a molecule rotated, moved 100 Å away and listed in reverse are the original set, transformed | "same molecule, same answer, however presented" |
 
-All at `atol=1e-8`. The permutation test sorts both center arrays before comparing because the
-set is unordered — it checks the *set* is preserved, not slot-by-slot identity (which also holds
-here, but sorting is the honest test).
+All at `atol=1e-8` (the last at `1e-7`). Candidates belong to atoms ([model](model.md) §5), so a
+permutation of the atoms permutes their candidates and nothing else. Under a mirror the two
+members of a ± pair trade places, because their offset `u × v` is a pseudovector; the pair is
+compared as a set. The fixture randomizes every weight first, so zero-initialized layers can't
+make a check pass trivially.
 
 ## 3. The point that makes this special: **it runs on the UNTRAINED net**
 

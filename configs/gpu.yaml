@@ -10,12 +10,15 @@ model:
     cutoff: 10.0
 
 wannier:
-  max_centers: 28
+  max_centers: 28          # pads the TRUE centers per spin (≥ the largest molecule's count)
   spins: [up, down]
   guide_sigma: 0.3         # A; FIXED width of the cloud guide term (below the ~0.6-1 A gap
                            #   between neighboring centers). Never predicted (§6).
   radius_weight: 1.0       # weight of the matched radius regression (normalized by std)
   guide_weight: 0.1        # weight of the fixed-width cloud guide vs matched positions
+  select_weight: 1.0       # weight of the candidate-selection term (BCE: matched -> 1)
+  singles_per_atom: 2      # candidate centers each atom proposes per spin (model/heads.py)
+  pairs_per_atom: 1        # ± candidate pairs per atom per spin (off-plane centers)
 
 loss:
   lambda_energy: 1.0

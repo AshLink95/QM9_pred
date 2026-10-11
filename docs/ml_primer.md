@@ -137,15 +137,17 @@ natural order**. Nothing makes one center "the first". That breaks the obvious l
 How this project scores a predicted set against the true set, per spin:
 
 1. **The count is not predicted.** Each spin has (valence electrons) / 2 centers, a fact of the
-   physics ([physics_primer](physics_primer.md) §5). The network always outputs a fixed number of
-   **slots** (28) per spin, and the first k are its predictions.
-2. **Matching:** pair each predicted center with one true center so that the total distance is
+   physics ([physics_primer](physics_primer.md) §5). Every atom proposes a few **candidate**
+   centers (4 per spin by default), each with a **selection score**; the k highest-scoring
+   candidates are the prediction.
+2. **Matching:** pair each true center with one candidate so that the total distance is
    as small as possible. This is the **assignment problem**, solved exactly by the **Hungarian
    algorithm** (`scipy.optimize.linear_sum_assignment`). Example with 3 centers: if prediction A
    is closest to truth #2, B to #3, and C to #1, the matching pairs them that way regardless of
    output order.
 3. **Loss on the pairs:** squared distance for each matched pair (positions), and squared
-   difference of radii.
+   difference of radii. The scores are trained as a yes/no classification: candidates the matching
+   chose → "yes", the rest → "no".
 4. **A smooth "guide" term:** each set is also drawn as a blurred cloud of fixed width, and the
    two clouds are compared. That needs no pairing, so it gives steady guidance early in training,
    when the matching still flips around.
@@ -155,6 +157,20 @@ width and strength. It learned to cover the true centers with a few wide, faint 
 scored well on that loss and was useless in practice (center count right 0.1% of the time).
 **Never let the model control the measuring stick.** If a quantity can be computed (the count)
 or should be fixed (the guide's width), don't make it a prediction inside the loss.
+
+### Lists vs sets: why candidates belong to atoms
+A first version output a fixed **list** of slots, each computed from all atoms by one shared
+rule. That rotates correctly, but think of methane: its four hydrogens look identical to the
+network, so each slot gets the same contribution from all four, and those cancel — every slot
+landed exactly on the carbon, for any weights. The true centers are on the four C–H bonds. The
+general rule: **an equivariant function can't make its output less symmetric than its input**
+(Xie & Smidt 2024, [refs](refs.md)). Turn methane by 120° and you get the same methane; the
+network must then return the same list, and each slot must stay put under the turn — only points
+on the rotation axis do. The physics asks for less: the *set* of centers must come back, but
+individual centers may swap places. Outputs indexed by **atoms** have exactly that freedom: when
+the turn swaps two hydrogens, their candidates swap too. Nothing random is added; the same
+molecule always gives the same set. (For centers above and below the plane of a flat molecule,
+candidates come in mirror pairs; see [model](model.md) §5.)
 
 ## 10. Balancing several targets
 
@@ -280,4 +296,7 @@ result is practically the same, and CPU and GPU no longer wait for each other.
 - Satorras, Hoogeboom, Welling, "E(n) Equivariant Graph Neural Networks", ICML (2021).
 - Carion et al., "End-to-End Object Detection with Transformers" (DETR), ECCV (2020) — the
   matched set loss.
+- Xie & Smidt, "Equivariant Symmetry Breaking Sets", TMLR (2024) — why a symmetric model must
+  output a set, not a list, for symmetric inputs.
 - The JAX documentation, "JAX 101" tutorials (jax.readthedocs.io).
+- Full bibliography with what each source is used for: [refs](refs.md).

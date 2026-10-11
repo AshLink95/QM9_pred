@@ -14,7 +14,7 @@ architecture itself.
 **New to the project?** Start with [`docs/README.md`](docs/README.md). It gives a reading order
 that starts from zero physics and zero machine learning (physics primer → ML primer → developer
 guide → one doc per code directory) plus a glossary. Design decisions and their reasons are in
-[`CLAUDE.md`](CLAUDE.md).
+[`CLAUDE.md`](CLAUDE.md); academic sources in [`docs/refs.md`](docs/refs.md).
 
 ---
 
@@ -83,7 +83,7 @@ uv run python -m scripts.train --config configs/gpu.yaml --dataset dataset.pkl -
 - The first epoch is slow (~30 min of one-time compilation); the compile cache (`.jax_cache/`)
   makes later jobs skip it.
 
-**A sweep** (13 planned variants, then a long final run of the winner), spread over many jobs:
+**A sweep** (planned variants, then a long final run of the winner), spread over many jobs:
 ```bash
 bash scripts/train-bunch.sh                                  # submit this from N jobs (§4)
 .venv/bin/python -m scripts.sweep status configs/sweep.yaml  # progress table
@@ -107,7 +107,9 @@ uv run python -m scripts.evaluate --config configs/gpu.yaml --params params.msgp
     symmetry check. Also printed.
   - `molecules.csv`: per molecule, SIESTA vs predicted energy and per-spin errors.
   - `centers.csv`: per center, SIESTA's position and radius next to the matched prediction.
-  - `accuracy.png`: six panels of error distributions.
+  - `plots/`: one image per plot, spin up and down pooled — `energy_error_vs_energy.png`,
+    `energy_error_hist.png`, `center_error_hist.png`, `radius_parity.png`,
+    `molecule_center_error_hist.png`.
 - How to read these numbers (what is good or bad): [docs/ml_primer.md](docs/ml_primer.md) §13.
 
 ### Step 4 — Predict new molecules
@@ -165,7 +167,9 @@ Failed run: read `runs/<sweep>/<run>/error.txt`, then
 |---|---|
 | `model.hidden_dim`, `model.n_layers` | network width and depth |
 | `model.rbf.*` | how distances are expanded into features |
-| `wannier.max_centers` | output slots per spin (must be ≥ the largest molecule's count; 28 here) |
+| `wannier.max_centers` | padding for the TRUE centers per spin (≥ the largest molecule's count; 28 here) |
+| `wannier.singles_per_atom`, `wannier.pairs_per_atom` | candidate centers each atom proposes per spin (default 2 singles + 1 ± pair) |
+| `wannier.select_weight` | weight of the candidate-selection term |
 | `wannier.spins` | `[up, down]` |
 | `wannier.guide_sigma` | fixed width (Å) of the smooth guide term in the Wannier loss |
 | `wannier.radius_weight`, `wannier.guide_weight` | weights of the radius and guide terms |
@@ -178,7 +182,7 @@ Failed run: read `runs/<sweep>/<run>/error.txt`, then
 | `train.split_seed`, `train.val_frac`, `train.test_frac` | the train/val/test split (keep `split_seed` fixed) |
 
 Files: `default.yaml` (CPU), `gpu.yaml` (GPU, larger batches), `energy_only.yaml` (energy alone,
-for a quick sanity check), `sweep.yaml` (the planned sweep: base config, 13 variants, stage
+for a quick sanity check), `sweep.yaml` (the planned sweep: base config, variants, stage
 settings; see [docs/sweeps.md](docs/sweeps.md)).
 
 ## 6. Tests and notebooks
@@ -225,11 +229,12 @@ docs/       documentation, from zero background
 - **v1 model** (first full training, Gaussian-cloud Wannier loss): test energy MAE **0.168 eV**
   (composition baseline 0.913 eV). Wannier centers were not usable (center error 0.61 Å, count
   right 0.1%).
-- **Current code** replaces the Wannier loss: center count computed from composition, per-spin
-  Hungarian-matched positions and radii, fixed-width guide (CLAUDE.md §6). **Awaiting retrain**;
-  targets: count 100%, radius ≤ 0.05 Å, center error well below 0.1 Å (label noise floor
-  ~0.013 Å), energy ≤ 0.168 eV.
-- Training now has multi-GPU data parallelism, best-epoch keeping with exact resume, per-epoch
-  Wannier metrics, a cosine learning-rate schedule, early stopping, and a parallel sweep queue
-  (`configs/sweep.yaml`, `scripts/train-bunch.sh`). Next step: run the sweep.
+- **v2** (sweep `wannier_v2`: center count from composition, Hungarian-matched loss, global
+  slot head): test energy MAE **0.058 eV**, radius MAE **0.022 Å**, count 100%, but center error
+  stuck at **0.36 Å**. Cause: global slots must sit on a molecule's symmetry axes/planes (all of
+  methane's slots on the carbon; nothing out of plane in flat molecules), measured as 19% of
+  predicted centers piled up.
+- **Current code** (sweep `wannier_v3`): per-atom candidate centers + ± pairs, selection logits
+  (CLAUDE.md §5–§6, [docs/model.md](docs/model.md) §5). **Awaiting the v3 sweep**; v2 checkpoints
+  don't load into the new head.
 - Not implemented: molecule ids saved in `dataset.pkl`; multi-node training.

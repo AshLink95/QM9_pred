@@ -22,8 +22,9 @@ a batch in `training/train.py:_batch_loss`.)
 
 ## 2. The problem: comparing two unordered sets
 
-Predicted centers come out of `WannierHead` as `M` slots per spin. True centers are an
-**unordered set**: predicted slot #k has no natural correspondence to true center #k. A loss
+Predicted centers come out of `WannierHead` as `C` candidates per spin (a few per atom,
+[model](model.md) §5). True centers are an **unordered set**: candidate #k has no natural
+correspondence to true center #k. A loss
 like `Σ ‖pred[k] − true[k]‖²` would punish a perfectly correct set emitted in a different order,
 which gives contradictory gradients. Any Wannier loss has to be order-free.
 
@@ -38,9 +39,10 @@ With width and strength under its control, blurring scored well.
 
 Three facts make a sharper loss possible:
 - **The count is known.** Spin `s` of a molecule has `k = Σ valence(Z) / 2` centers
-  (`data/electrons.py`; true for 100% of the dataset). The first `k` slots of that spin are its
-  predictions, with no presence score.
-- With a known count, **one-to-one matching** is clean (no existence scores, no padding games).
+  (`data/electrons.py`; true for 100% of the dataset). The head offers more candidates than that
+  (`C ≥ k`); the `k` with the highest selection logits are the prediction.
+- With a known count, **one-to-one matching** is clean: each true center gets exactly one
+  candidate, and the rest are "not chosen".
 - **Spin is separate everywhere:** every term below is computed per spin, so an up center can
   never pair with a down center.
 
@@ -49,12 +51,18 @@ Three facts make a sharper loss possible:
 perm = assign(pred_centers, true_centers, k, pool)   # NumPy + SciPy, on the host
 loss = wannier_match_loss(..., k, perm, ...)          # jitted, on the GPU
 ```
-- For each molecule and spin, `scipy.optimize.linear_sum_assignment` on the `k × k` matrix of
-  squared distances finds the one-to-one pairing with the smallest total. `assign` does this for a
-  whole batch, spread over a **thread pool** (SciPy releases Python's GIL, so the threads truly
-  run in parallel).
-- `perm[b, s, i]` = which predicted slot is paired with true center `i`. Slots `≥ k` keep the
-  identity and are masked out.
+- For each molecule and spin, `scipy.optimize.linear_sum_assignment` on the `k × C` matrix of
+  squared distances (true centers × candidates; rectangular is fine) picks `k` candidates and the
+  one-to-one pairing with the smallest total. `assign` does this for a whole batch, spread over a
+  **thread pool** (SciPy releases Python's GIL, so the threads truly run in parallel).
+- `perm[b, s, i]` = which candidate is paired with true center `i` (entries `i ≥ k` are padding,
+  masked out).
+- **Pairs are used whole** (`layout=(singles, pairs)`): the two members of a ± pair share one
+  selection logit, because a mirror may swap them. If the matching uses only one member — e.g. a
+  pair collapsed onto an in-plane spot standing in for a single — that logit would get the targets
+  1 and 0 at once and settle at "maybe". So a half-used pair is excluded and the assignment
+  re-solved (a few rounds at most). Off-plane centers come in mirror pairs, so the pair that sits
+  on them is matched whole.
 - The pairing is a discrete choice and **isn't differentiated** (as in DETR): inside the loss it
   passes through `jax.lax.stop_gradient`. Gradients flow through the distances of the chosen pairs.
 - **Why on the CPU, outside the compiled step:** training overlaps it with GPU work. The CPU pairs
@@ -70,8 +78,9 @@ mc  = take_along_axis(pred_c, perm)                  # predicted center paired w
 mr  = take_along_axis(pred_r, perm)
 pos = Σ mask·‖true_c − mc‖² / n                      # Å²
 rad = Σ mask·((true_r − mr) / r_std)² / n            # dimensionless
-guide = mean over (molecule, spin) of cloud_l2(...)/k   # fixed width, unit amplitudes
-total = pos + radius_weight·rad + guide_weight·guide
+select = mean BCE(logit, chosen)                     # chosen = 1 if matched, else 0
+guide = mean over (molecule, spin) of cloud_l2(matched, true)/k   # fixed width, unit amplitudes
+total = pos + radius_weight·rad + select_weight·select + guide_weight·guide
 ```
 - `mask[b,s,i] = i < k[b,s]`: only real centers count, and `n` is how many there are.
 - **Position** is plain squared error on matched pairs. That's sharp: it keeps pushing until each
@@ -79,11 +88,18 @@ total = pos + radius_weight·rad + guide_weight·guide
 - **Radius** is regressed directly per matched pair, divided by the dataset's radius std
   (`r_std`, measured on the train split at startup). The head's radius output starts at the
   dataset mean ([model](model.md) §5), so training starts at "constant guess" quality.
-- **Guide** is the closed-form cloud overlap (§4–§5) with a **fixed** width `guide_sigma` (0.3 Å)
-  on both sides and amplitude 1 for every real center. Early in training the pairing can flip
+- **Selection** is binary cross-entropy on every candidate's logit: 1 if the matching chose it,
+  0 otherwise. At prediction time the `k` highest logits are the centers
+  (`model/heads.py:select_centers`). It is classification only — no amplitude or width ever
+  enters an overlap — so it can't be used to blur (the first loss's failure).
+  **Validation, the report and `main.py` score the selected candidates**, never a match over all
+  `C` (that would flatter the numbers: with 4 candidates per atom, something is always close).
+- **Guide** is the closed-form cloud overlap (§4–§5) between the matched candidates and the truth,
+  with a **fixed** width `guide_sigma` (0.3 Å) and amplitude 1 for every real center. Early in
+  training the pairing can flip
   from step to step. The guide doesn't care about pairing and gives a smooth pull toward the
   right region. Because its width is fixed, it can't be gamed by widening blobs.
-- Weights come from `configs/*.yaml` (`wannier.radius_weight`, `wannier.guide_weight`); the
+- Weights come from `configs/*.yaml` (`wannier.radius_weight`, `select_weight`, `guide_weight`); the
   whole Wannier term is scaled by `loss.lambda_wannier` (0 in `energy_only.yaml` skips it
   entirely).
 
@@ -118,11 +134,14 @@ have amplitude 0 and drop out.
 
 ## 6. Why not the alternatives (so you can defend it)
 - **Learned count / presence score:** the count is physics (valence electrons / 2), so learning
-  it only adds a way to fail. It's what let the first loss blur.
+  it only adds a way to fail. It's what let the first loss blur. (The selection logit only
+  chooses *which* candidates; the count stays computed.)
 - **Density loss with predicted widths:** width becomes a blur knob. That's the measured failure.
-- **Per-atom assignment (Deep Wannier style):** works in water, where every center clearly
+- **Fixed per-atom assignment (Deep Wannier style):** works in water, where every center clearly
   belongs to one oxygen. In organics a C–C bond center sits exactly halfway between two carbons,
-  so "nearest atom" is a coin flip and per-atom counts vary.
+  so "nearest atom" is a coin flip and per-atom counts vary. The head's candidates are per atom
+  too, but no center is *assigned* to an atom: the matching lets any atom's candidate take any
+  center, and the selection decides how many each atom contributes.
 - **Chamfer distance:** no matching needed, but it allows duplicates (two predictions on one true
   center). Matching rules that out.
 - **Literal region/IoU overlap:** no closed form (needs a grid) and zero gradient until shapes
@@ -139,13 +158,18 @@ have amplitude 0 and drop out.
 | `ValueError: no valence charge for element(s)` | a new element appeared | add it to `data/electrons.py:VALENCE` (must match the pseudopotentials) |
 | `WARNING: dropped N training molecules whose Wannier count != valence/2` | parsed count disagrees with the rule | inspect those molecules (open-shell? bad `.wout`?) |
 | up center paired with down | someone merged spins | every term must loop/index per spin |
+| `select` stuck near 0.69 (log 2) | logits never separate | check `select_weight`; check `layout` is passed to `assign` (half-used pairs) |
+| val center error far above train `pos` | selection picks wrong candidates | compare with the matched training error; raise `select_weight` |
 | `test_zero_on_identical` fails at ~1e-7 | float32 rounding | tolerance is `1e-5` on purpose |
 
 ## Rebuild-by-hand order
 1. `centers_per_spin` (valence table, closed-shell rule).
 2. `cloud_l2` (closed-form overlap; zero on identical sets).
-3. Host `assign` (per-(molecule, spin) Hungarian on a thread pool) returning `perm`.
+3. Host `assign` (per-(molecule, spin) rectangular Hungarian on a thread pool, pairs used whole)
+   returning `perm`.
 4. `wannier_match_loss(…, perm)`: mask from `k`, matched position and radius terms
-   (`stop_gradient` on `perm`), fixed-width guide.
+   (`stop_gradient` on `perm`), selection BCE, fixed-width guide.
 5. Tests (`tests/test_wannier_match.py`): zero on a reordered truth, a known offset gives a known
-   value, spins never mix, gradients finite under `jit`, unused slots get no gradient.
+   value, spins never mix, more candidates than centers, the selection target follows the
+   pairing, pairs used whole, gradients finite under `jit`, unmatched candidates get no position
+   pull.

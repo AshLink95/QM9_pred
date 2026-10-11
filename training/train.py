@@ -39,6 +39,7 @@ from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
 from data.dataset import split
 from data.electrons import centers_per_spin
 from losses.wannier_match import assign, wannier_match_loss
+from model.heads import select_centers
 from model.model import model_from_config
 from training.metrics import match_wannier
 
@@ -161,10 +162,11 @@ def _batch_loss(params, model, batch, perm, lam_e, lam_w, wkw):
     out = jax.vmap(lambda z, p: model.apply(params, z, p))(batch["z"], batch["pos"])
     e = jnp.mean((out["energy"] - batch["energy"]) ** 2)
     zero = jnp.zeros(())
-    w, parts = zero, {"pos": zero, "radius": zero, "guide": zero}
+    w, parts = zero, {"pos": zero, "radius": zero, "select": zero, "guide": zero}
     if lam_w > 0:
-        w, parts = wannier_match_loss(out["wannier"]["centers"], out["wannier"]["radii"],
-                                      batch["centers"], batch["radii"], batch["k"], perm, **wkw)
+        o = out["wannier"]
+        w, parts = wannier_match_loss(o["centers"], o["radii"], o["logits"], batch["centers"],
+                                      batch["radii"], batch["k"], perm, **wkw)
     return lam_e * e + lam_w * w, {"E": e, "W": w, **parts}
 
 
@@ -209,19 +211,22 @@ def make_lr(tc, spe):
 
 # ------------------------------------------------------------------ validation
 def _validate(fwd, params, buckets, examples, put, spins, lam_e, lam_w, wkw, batch_size, pool):
-    """Predict every validation molecule once, pair centers on the host, and compute the val
-    objective (training objective without the guide term) plus readable metrics."""
+    """Predict every validation molecule once, keep the k top-scoring candidates per spin (as
+    at prediction time), pair them with the truth on the host, and compute the val objective
+    (energy + matched position/radius terms; no guide or selection term) plus readable
+    metrics."""
     S = len(spins)
     e_err, jobs = [], []
     for n, idx, real in eval_batches(buckets, batch_size):
         b = _gather(buckets, n, idx)
         out = jax.device_get(fwd(params, put(b["z"]), put(b["pos"])))
+        sel = select_centers(out["wannier"])
         for j in range(real):
             ex = examples[buckets[n]["index"][idx[j]]]
             e_err.append(float(out["energy"][j]) - float(ex["energy"]))
             for s in range(S):
                 w = ex["wannier"][s]
-                jobs.append((s, out["wannier"]["centers"][j, s], out["wannier"]["radii"][j, s],
+                jobs.append((s, sel["centers"][j, s], sel["radii"][j, s],
                              int(b["k"][j, s]), w["centers"], w["radii"]))
     matches = list(pool.map(lambda a: (a[0], match_wannier(*a[1:])), jobs))
     e_err = np.array(e_err)
@@ -312,6 +317,12 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
     train_b = stack_buckets(train_ex, n_spins, kmax)
     val_b = stack_buckets(val_ex, n_spins, kmax) if val_ex else {}
     spe = steps_per_epoch(train_b, B)
+    per_atom = wc.get("singles_per_atom", 2) + 2 * wc.get("pairs_per_atom", 1)
+    for n, b in {**train_b, **val_b}.items():           # the head must offer >= k candidates
+        if b["k"].max() > n * per_atom:
+            raise ValueError(f"a {n}-atom molecule has {b['k'].max()} centers per spin but the "
+                             f"head offers {n * per_atom} candidates; raise "
+                             "wannier.singles_per_atom / pairs_per_atom")
     print(f"train {len(train_ex)}  val {len(val_ex)}  max_centers {kmax}  batch_size {B}  "
           f"steps/epoch {spe}", flush=True)
 
@@ -324,7 +335,8 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
     print(f"Wannier radius: mean {r_mean:.4f} A, std {r_std:.4f} A  (radius output starts at "
           f"the mean)", flush=True)
     wkw = {"r_std": r_std, "guide_sigma": wc["guide_sigma"],
-           "radius_weight": wc["radius_weight"], "guide_weight": wc["guide_weight"]}
+           "radius_weight": wc["radius_weight"], "guide_weight": wc["guide_weight"],
+           "select_weight": wc.get("select_weight", 1.0)}
 
     model = model_from_config(cfg, atom_ref=atom_ref, radius_init=r_mean)
     params = model.init(jax.random.PRNGKey(tc["seed"]),
@@ -382,7 +394,7 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
     step = jax.jit(_step, out_shardings=repl)
 
     workers = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
-    zero_perm = put(np.broadcast_to(np.arange(kmax, dtype=np.int32), (B, n_spins, kmax)).copy())
+    zero_perm = put(np.zeros((B, n_spins, kmax), np.int32))     # unused when lam_w == 0
     status = "finished"
 
     def make_batch(item):
@@ -393,7 +405,8 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         def pairing(host, out_centers):
-            return put(assign(np.asarray(out_centers), host["centers"], host["k"], pool))
+            return put(assign(np.asarray(out_centers), host["centers"], host["k"], pool,
+                              layout=(wc.get("singles_per_atom", 2), wc.get("pairs_per_atom", 1))))
 
         epoch = int(state["epoch"])
         while epoch < tc["epochs"]:
@@ -443,8 +456,8 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
                 mean = lambda key: float(np.mean([float(a[key]) for _, a in vals]))
                 line = (f"epoch {epoch:4d}  lr {lr_at((epoch + 1) * spe):.2e}  train "
                         f"{losses.mean():.4f} (E {mean('E'):.4f}  W {mean('W'):.4f} = pos "
-                        f"{mean('pos'):.4f} A^2, radius {mean('radius'):.4f}, guide "
-                        f"{mean('guide'):.4f})")
+                        f"{mean('pos'):.4f} A^2, radius {mean('radius'):.4f}, select "
+                        f"{mean('select'):.4f}, guide {mean('guide'):.4f})")
                 if val_b:
                     v = _validate(fwd, params, val_b, val_ex, put, spins, lam_e, lam_w, wkw, B,
                                   pool)
