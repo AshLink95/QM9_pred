@@ -107,3 +107,18 @@ def test_tiny_sweep_end_to_end(tmp_path):
         assert json.loads((q.root / name / "result.json").read_text())["test_energy_mae"] > 0
     table = sweep.status(path)
     assert "final" in table and "r0" in table and " *" in table
+
+
+def test_inline_base_equals_file_base(tmp_path):
+    """configs/sweep.yaml carries its base config inline; same result as a base file."""
+    _, spec = _spec(tmp_path)
+    inline = {**spec, "base": BASE}
+    for run in spec["runs"]:
+        assert sweep.stage1_config(inline, run) == sweep.stage1_config(spec, run)
+
+
+def test_shipped_sweep_resolves():
+    """Every run in configs/sweep.yaml resolves against its base (catches stale keys)."""
+    spec = sweep.load_sweep("configs/sweep.yaml")
+    for run in spec["runs"]:
+        sweep.stage1_config(spec, run)

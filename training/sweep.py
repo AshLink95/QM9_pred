@@ -54,7 +54,8 @@ def set_dotted(cfg, key, value):
     for p in path:
         node = node[p]
     if last not in node:
-        raise KeyError(f"override '{key}': no such config key")
+        raise KeyError(f"override '{key}': no such config key (the base config doesn't have it; "
+                       "was it written before this key existed?)")
     node[last] = value
 
 
@@ -66,7 +67,9 @@ def apply_overrides(cfg, overrides):
 
 
 def stage1_config(spec, run):
-    base = yaml.safe_load(Path(spec["base"]).read_text())
+    """`base` is the run config itself (inline mapping) or a path to one."""
+    base = spec["base"]
+    base = base if isinstance(base, dict) else yaml.safe_load(Path(base).read_text())
     return apply_overrides(apply_overrides(base, spec.get("stage1_overrides")),
                            run.get("overrides"))
 

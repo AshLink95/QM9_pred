@@ -3,12 +3,52 @@
 # (by name) are never duplicated or changed.
 
 # v3: the per-atom candidate Wannier head (model/heads.py). v2 (global slots) finished; its runs
-# stay in runs/wannier_v2/ and its plan is in git history.
+# stay in runs/wannier_v2/ and its plan is in git history. This file is self-contained: `base`
+# below is the full run config (a copy of configs/gpu.yaml), so nothing else is read.
 name: wannier_v3                # runs are written to runs/<name>/
-base: runs/wannier_v2/final/config.yaml   # the v2 winner's resolved config (configs/gpu.yaml if
-                                          # you don't have it); new head keys use their defaults
 dataset: dataset.pkl            # read-only, shared by all runs
 stale_minutes: 30               # no-heartbeat fallback when squeue can't tell if an owner died
+
+# Every run starts from this config (same keys as configs/gpu.yaml); runs below change one key.
+base:
+  model:
+    hidden_dim: 128
+    n_layers: 4
+    n_elements: 100
+    rbf:
+      enabled: true
+      n_basis: 16
+      cutoff: 10.0
+
+  wannier:
+    max_centers: 28          # pads the TRUE centers per spin (≥ the largest molecule's count)
+    spins: [up, down]
+    guide_sigma: 0.3         # A; FIXED width of the cloud guide term (below the ~0.6-1 A gap
+                             #   between neighboring centers). Never predicted (§6).
+    radius_weight: 1.0       # weight of the matched radius regression (normalized by std)
+    guide_weight: 0.1        # weight of the fixed-width cloud guide vs matched positions
+    select_weight: 1.0       # weight of the candidate-selection term (BCE: matched -> 1)
+    singles_per_atom: 2      # candidate centers each atom proposes per spin (model/heads.py)
+    pairs_per_atom: 1        # ± candidate pairs per atom per spin (off-plane centers)
+
+  loss:
+    lambda_energy: 1.0
+    lambda_wannier: 1.0
+
+  train:
+    lr: 1.0e-3
+    grad_clip: 1.0            # clip global grad norm (stability safety net)
+    lr_schedule: cosine        # cosine = warmup then smooth decay to lr*lr_end_frac; or constant
+    warmup_epochs: 5           # linear ramp 0 -> lr over the first epochs
+    lr_end_frac: 0.01          # final learning rate = 1% of lr
+    batch_size: 256          # GPU-sized; drop if you hit device OOM
+    epochs: 300
+    ckpt_every: 5
+    patience: 0               # early stop after N validations without a new best (0 = off)
+    seed: 0                   # initialization + batch order
+    split_seed: 0             # train/val/test split (keep fixed so runs share one test set)
+    val_frac: 0.1
+    test_frac: 0.1
 
 # Stage 1 (screening): applied to every run below. Early stopping frees GPUs from poor variants.
 stage1_overrides:

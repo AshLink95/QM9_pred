@@ -101,8 +101,11 @@ molecules never influence any choice.
 
 All runs share `split_seed: 0`, so all are scored on the **same test molecules**.
 
-**Current plan: `wannier_v3`** (the per-atom candidate head, [model](model.md) §5). Base = the v2
-winner's resolved config, `runs/wannier_v2/final/config.yaml`:
+**Current plan: `wannier_v3`** (the per-atom candidate head, [model](model.md) §5). The sweep file
+is self-contained: its `base:` is the full run config written inline (a copy of
+`configs/gpu.yaml`), so nothing outside it is read. (`base:` may also be a path to a config file.)
+Every override must name a key that exists in the base; a base written before a key was added
+fails at start-up with `no such config key`.
 
 | Runs | What changes | Question it answers |
 |---|---|---|
