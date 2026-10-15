@@ -63,10 +63,18 @@ def load_fresh(dirs, spins):
 
 
 # ------------------------------------------------------------------------ prediction
-def predict_all(model, params, examples, batch_size=256):
+def nms_radius(cfg) -> float:
+    """NMS radius used when selecting centers for prediction. Configs written before the key
+    existed (v3 and older) get 0.3 Å, so re-evaluating an old checkpoint merges duplicates too
+    (true centers: 1st-percentile spacing 0.48 Å)."""
+    return float(cfg["wannier"].get("nms_radius", 0.3))
+
+
+def predict_all(model, params, examples, batch_size=256, nms=0.0):
     """Forward pass over all examples, batched by atom count; returns per-example outputs in
-    INPUT ORDER. Every chunk is padded (by repetition) to `batch_size` and the extras dropped,
-    so there's exactly one compiled shape per atom count."""
+    INPUT ORDER, centers ordered so the first k = Σ valence/2 per spin are the selected ones
+    (top logits, near-duplicates within `nms` Å suppressed). Every chunk is padded (by
+    repetition) to `batch_size` and the extras dropped: one compiled shape per atom count."""
     fwd = jax.jit(lambda prm, z, p: jax.vmap(lambda zz, pp: model.apply(prm, zz, pp))(z, p))
     buckets = defaultdict(list)
     for i, e in enumerate(examples):
@@ -79,22 +87,31 @@ def predict_all(model, params, examples, batch_size=256):
             res = jax.device_get(fwd(params,
                                      np.stack([examples[i]["z"] for i in padded]),
                                      np.stack([examples[i]["pos"] for i in padded])))
-            w = select_centers(res["wannier"])         # k top-scoring candidates first
+            k = np.stack([centers_per_spin(examples[i]["z"], res["wannier"]["logits"].shape[1])
+                          for i in padded])
+            w = select_centers(res["wannier"], k, nms)   # the k selected centers first
             for j, i in enumerate(chunk):
                 out[i] = {"energy": float(res["energy"][j]), "centers": w["centers"][j],
                           "radii": w["radii"][j]}
     return out
 
 
-def rotation_drift(model, params, ex):
-    """Symmetry spot-check on one molecule: rotate input, compare outputs (should be ~0)."""
+def rotation_drift(model, params, ex, nms=0.0):
+    """Symmetry spot-check on one molecule: rotate the input; the energy should not change and
+    the selected center set should rotate with it. Sets are compared after matching, so float
+    noise that swaps two near-equal logits doesn't count. Returns (eV, Å) maxima."""
     z, pos = np.asarray(ex["z"]), np.asarray(ex["pos"])
     base = model.apply(params, z, pos)
     R = T.random_rotation(seed=0)
     rot = model.apply(params, z, T.rotate(pos, R))
-    bc, rc = select_centers(base["wannier"])["centers"], select_centers(rot["wannier"])["centers"]
-    return (abs(float(rot["energy"]) - float(base["energy"])),
-            float(np.max(np.abs(rc - bc @ R.T))))
+    k = centers_per_spin(z, np.asarray(base["wannier"]["logits"]).shape[0])
+    bs, rs = select_centers(base["wannier"], k, nms), select_centers(rot["wannier"], k, nms)
+    drift = 0.0
+    for s, ks in enumerate(k):
+        m = match_wannier(rs["centers"][s], rs["radii"][s], ks, bs["centers"][s][:ks] @ R.T,
+                          bs["radii"][s][:ks])
+        drift = max([drift] + [p[2] for p in m["pairs"]])
+    return abs(float(rot["energy"]) - float(base["energy"])), float(drift)
 
 
 # ------------------------------------------------------------------------ comparison
@@ -387,11 +404,11 @@ def evaluate_checkpoint(cfg, params_path, out_dir, *, examples=None, dataset_pat
         raise SystemExit(f"{params_path} doesn't match the config ({err}). "
                          "Use the config the model was trained with.")
 
-    preds = predict_all(model, params, examples, batch_size)
+    preds = predict_all(model, params, examples, batch_size, nms_radius(cfg))
     ref = params["params"].get("atom_ref", {}).get("embedding")
     atom_ref = None if ref is None else np.asarray(ref)[:, 0]
     mol_rows, center_rows, summary, data = build_report(examples, preds, names, spins, atom_ref)
-    de, dc = rotation_drift(model, params, examples[0])
+    de, dc = rotation_drift(model, params, examples[0], nms_radius(cfg))
     text = format_summary(summary, [f"Accuracy report — model {params_path}"] + header) + (
         f"\n\nSYMMETRY spot-check (random rotation, one molecule): energy drift {de:.2e} eV, "
         f"center drift {dc:.2e} A")

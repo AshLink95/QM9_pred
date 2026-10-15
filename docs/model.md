@@ -223,8 +223,15 @@ pair:    c±  = b_i ± s_i · (u_i × v_i)          # P per atom (pairs_per_atom
   that starts collapsed is never nearer to an off-plane target than an in-plane single, so it
   would never be matched (seen in a one-molecule fit).
 - **Choosing the centers:** the count is still not predicted — spin `s` has `k = Σ valence/2`
-  centers (`data/electrons.py`). `select_centers` orders candidates by logit; the first `k` are
-  the prediction. Training teaches the logits ([losses](losses.md) §3). Every consumer
+  centers (`data/electrons.py`). `select_centers(wannier, k, nms_radius)` takes candidates by
+  logit, highest first, and **skips any candidate within `nms_radius` (0.3 Å) of one already
+  taken** (non-maximum suppression, NMS), until `k` are chosen. True centers are never that close
+  (1st-percentile spacing 0.48 Å). NMS is needed because of symmetry, not as a patch: a center on
+  a symmetry element (the midpoint of a symmetric C–C bond) is approached by identical candidates
+  from both carbons, and an exactly equivariant model can only offer those twins together; without
+  NMS both were selected (v3: 52% of sets had a duplicate, and 61% of the > 1 Å errors came with
+  one). NMS decides with logits and distances only, so the selected set still transforms with
+  the molecule. Training teaches the logits ([losses](losses.md) §3). Every consumer
   (validation, report, `main.py`) goes through `select_centers`.
 - **Known ceiling:** an atom on *two* mirror planes (the carbons of ethylene or benzene) can't
   form any nonzero pseudovector there (the second mirror forces `u × v = 0`), so its pairs stay
@@ -242,6 +249,15 @@ returns `{"energy": scalar, "wannier": {centers[S,C,3], radii[S,C], logits[S,C]}
 atom_ref=…, radius_init=…)` reads `configs/*.yaml` and constructs it — no magic numbers in code
 (CLAUDE.md §11). `atom_ref` and `radius_init` are only initial values, fitted from the train
 split at training start; inference loads the trained values from the checkpoint.
+
+Two backbone options from EGNN's own QM9 setup ([refs](refs.md)), both off by default and tried
+in the v4 sweep:
+- `model.update_coords: false` — the coordinate track `x` stays at the input positions (EGNN
+  didn't update coordinates for QM9 properties). The Wannier head still builds its vectors from
+  relative positions, so it is unaffected structurally.
+- `model.edge_gate: true` — each message is scaled by a learned soft weight in (0, 1),
+  `m_ij · sigmoid(φ_g(m_ij))` (EGNN's "attention"). The weight is an invariant scalar, so
+  equivariance is untouched (tested in `test_egnn_options_stay_equivariant`).
 
 ---
 

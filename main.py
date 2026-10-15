@@ -19,6 +19,7 @@ from data.electrons import centers_per_spin
 from data.parse_siesta import parse_fdf
 from model.heads import select_centers
 from model.model import model_from_config
+from training.report import nms_radius
 from training.train import load_config, load_params
 
 
@@ -30,13 +31,13 @@ def load_model(cfg, params_path, z0, pos0):
     return model, load_params(params_path, template)
 
 
-def record_for(name, out, spins, z):
+def record_for(name, out, spins, z, nms=0.0):
     """One JSON record: {input, energy, wannier:{spin:[{position, radius}, ...]}}.
     Each spin's centers are its k top-scoring candidates, k = valence electrons / 2
     (data/electrons.py)."""
-    sel = select_centers(out["wannier"])
-    centers, radii = sel["centers"], sel["radii"]
     k = centers_per_spin(z, len(spins))
+    sel = select_centers(out["wannier"], k, nms)
+    centers, radii = sel["centers"], sel["radii"]
     wannier = {spin: [{"position": [round(float(v), 6) for v in centers[s, j]],
                        "radius": round(float(radii[s, j]), 6)} for j in range(k[s])]
                for s, spin in enumerate(spins)}
@@ -70,7 +71,8 @@ def run_directory(input_dir, cfg, out_path, params_path):
     if mols:
         model, params = load_model(cfg, params_path, mols[0][1], mols[0][2])
         for name, z, pos in mols:
-            records.append(record_for(name, model.apply(params, z, pos), spins, z))
+            records.append(record_for(name, model.apply(params, z, pos), spins, z,
+                                      nms_radius(cfg)))
     records.extend({"input": name, "error": err} for name, err in errors.items())
     records.sort(key=lambda r: r["input"])
 
@@ -88,10 +90,10 @@ def run_single(fdf_path, cfg, params_path):
     out = model.apply(params, z, pos)
 
     print(f"energy = {float(out['energy']):.4f} eV")
-    sel = select_centers(out["wannier"])
-    centers, radii = sel["centers"], sel["radii"]
     spins = cfg["wannier"]["spins"]
     k = centers_per_spin(z, len(spins))
+    sel = select_centers(out["wannier"], k, nms_radius(cfg))
+    centers, radii = sel["centers"], sel["radii"]
     for s, spin in enumerate(spins):
         print(f"[{spin}] {k[s]} centers  (x y z  radius, Angstrom)")
         for c, r in zip(centers[s][:k[s]], radii[s][:k[s]]):

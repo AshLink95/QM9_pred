@@ -206,6 +206,20 @@ them:
 | training error ≈ validation error, both high | underfitting | more epochs, bigger model, learning-rate schedule |
 | validation error rising | overfitting | nothing to do by hand: the best epoch is kept automatically (§14), and early stopping can end the run |
 
+Three techniques this project uses because they are standard where accuracy matters
+([refs](refs.md)):
+- **Averaging the weights (EMA).** Each step moves the weights a little in a noisy direction.
+  Keeping a running average, `avg ← 0.99·avg + 0.01·weights`, and evaluating that average gives a
+  steadier model than the last step. Interatomic-potential codes (NequIP, MACE) do this.
+- **L1 vs squared losses.** A squared error lets a few large mistakes dominate: one 2 Å miss
+  counts like 400 misses of 0.1 Å. The absolute (L1) error counts it like 20, so training keeps
+  improving the many nearly-right predictions, which lowers the median. L1 is also what the
+  reported MAE measures.
+- **Non-maximum suppression (NMS).** When several predictions land on the same spot, keep the
+  highest-scoring one and drop the others within a small radius. Object detectors use it; here
+  it removes duplicate Wannier centers that an exactly symmetric model can't avoid producing
+  ([model](model.md) §5).
+
 ## 13. Reading the metrics
 
 | Metric | Meaning |

@@ -122,3 +122,41 @@ def test_selected_set_same_in_every_frame(fixture):
     for s in range(2):
         np.testing.assert_allclose(np.sort(out["centers"][s, :k], axis=0),
                                    np.sort(base["centers"][s, :k] @ R.T + t, axis=0), atol=1e-7)
+
+
+def test_selected_set_with_nms_same_in_every_frame(fixture):
+    """With NMS on, the selected set is still the same set in every frame and atom order."""
+    from model.heads import select_centers
+    apply, params, z, pos = fixture
+    model = _model()
+    R = T.random_rotation(seed=4)
+    t = np.array([-30.0, 80.0, 5.0])
+    rev = np.arange(len(z))[::-1]
+    k = np.array([5, 5])                       # any count works; fixture atoms aren't real
+    base = select_centers(apply(params, pos)["wannier"], k, 0.3)
+    out = select_centers(model.apply(params, jnp.array(np.asarray(z)[rev]),
+                                     jnp.array(np.asarray(pos)[rev] @ R.T + t))["wannier"], k, 0.3)
+    for s in range(2):
+        np.testing.assert_allclose(np.sort(out["centers"][s, :5], axis=0),
+                                   np.sort(base["centers"][s, :5] @ R.T + t, axis=0), atol=1e-7)
+
+
+@pytest.mark.parametrize("opts", [{"edge_gate": True}, {"update_coords": False}])
+def test_egnn_options_stay_equivariant(opts):
+    """EGNN's QM9 options (soft edge gate; fixed coordinates) keep every symmetry."""
+    rng = np.random.default_rng(5)
+    z = jnp.array(rng.integers(1, 10, size=6))
+    pos = jnp.array(rng.standard_normal((6, 3)) * 1.5)
+    model = QM9Model(hidden_dim=16, n_layers=3, n_elements=100, n_spins=2, n_basis=8,
+                     cutoff=10.0, **opts)
+    params = model.init(jax.random.PRNGKey(1), z, pos)
+    base = model.apply(params, z, pos)
+    R = np.asarray(T.random_rotation(seed=6))
+    t = np.array([0.4, -1.0, 2.0])
+    out = model.apply(params, z, jnp.array(np.asarray(pos) @ R.T + t))
+    np.testing.assert_allclose(out["energy"], base["energy"], atol=1e-8)
+    np.testing.assert_allclose(out["wannier"]["centers"],
+                               np.asarray(base["wannier"]["centers"]) @ R.T + t, atol=1e-8)
+    perm = T.permutation(6, seed=7)
+    outp = model.apply(params, z[perm], pos[perm])
+    np.testing.assert_allclose(outp["energy"], base["energy"], atol=1e-8)

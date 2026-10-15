@@ -166,15 +166,20 @@ Failed run: read `runs/<sweep>/<run>/error.txt`, then
 | Key | Meaning |
 |---|---|
 | `model.hidden_dim`, `model.n_layers` | network width and depth |
+| `model.update_coords`, `model.edge_gate` | EGNN options from its QM9 setup: freeze the coordinate track; soft edge gate (both off by default) |
 | `model.rbf.*` | how distances are expanded into features |
 | `wannier.max_centers` | padding for the TRUE centers per spin (≥ the largest molecule's count; 28 here) |
 | `wannier.singles_per_atom`, `wannier.pairs_per_atom` | candidate centers each atom proposes per spin (default 2 singles + 1 ± pair) |
 | `wannier.select_weight` | weight of the candidate-selection term |
+| `wannier.position_loss` | `l1` (distance, default) or `mse` (squared distance) for matched centers |
+| `wannier.nms_radius` | Å; selected centers closer than this are merged, and candidates this close to a matched one count as positives (0 = off; default 0.3) |
 | `wannier.spins` | `[up, down]` |
 | `wannier.guide_sigma` | fixed width (Å) of the smooth guide term in the Wannier loss |
 | `wannier.radius_weight`, `wannier.guide_weight` | weights of the radius and guide terms |
+| `loss.energy_loss` | `l1` (mean absolute ΔE divided by σ_E, default) or `mse` (ΔE² in eV²) |
 | `loss.lambda_energy`, `loss.lambda_wannier` | weights of the energy and Wannier losses (`0` turns one off) |
 | `train.lr`, `train.grad_clip` | peak learning rate, gradient-clipping limit |
+| `train.ema_decay` | moving average of the weights used for validation and checkpoints (0.99; 0 = off) |
 | `train.lr_schedule`, `train.warmup_epochs`, `train.lr_end_frac` | `cosine` (warmup, then decay to `lr·lr_end_frac`) or `constant` |
 | `train.patience` | early stopping: validations without improvement before stopping (0 = off) |
 | `train.batch_size`, `train.epochs`, `train.ckpt_every` | batch size (32 CPU / 256 GPU), epochs, checkpoint interval |
@@ -234,7 +239,12 @@ docs/       documentation, from zero background
   stuck at **0.36 Å**. Cause: global slots must sit on a molecule's symmetry axes/planes (all of
   methane's slots on the carbon; nothing out of plane in flat molecules), measured as 19% of
   predicted centers piled up.
-- **Current code** (sweep `wannier_v3`): per-atom candidate centers + ± pairs, selection logits
-  (CLAUDE.md §5–§6, [docs/model.md](docs/model.md) §5). **Awaiting the v3 sweep**; v2 checkpoints
-  don't load into the new head.
+- **v3** (sweep `wannier_v3`: per-atom candidate centers + ± pairs, selection logits): test
+  energy MAE **0.075 eV**, center MAE **0.127 Å** (median **0.056 Å**), radius MAE **0.011 Å**.
+  The center mean is dominated by duplicates: 2.6% of centers are > 1 Å off, mostly next to a
+  duplicate selection.
+- **Current code** (sweep `wannier_v4`): NMS selection with NMS-consistent targets, L1 losses
+  (normalized energy, distance for centers), weight EMA; EGNN QM9 options as sweep variants
+  (CLAUDE.md §5–§6, [docs/refs.md](docs/refs.md)). v3 checkpoints still load: re-evaluating one
+  applies NMS (`nms_radius` defaults to 0.3 Å for older configs). **Awaiting the v4 sweep.**
 - Not implemented: molecule ids saved in `dataset.pkl`; multi-node training.

@@ -121,16 +121,22 @@ once, pairs centers on the host, and computes:
 
 | Value | Meaning |
 |---|---|
-| **val objective** | `λ_E · energy MSE + λ_W · (matched position MSE + radius_weight · normalized radius MSE)`, computed on the **selected** centers (the k top-scoring candidates per spin, as at prediction time), without the guide and selection terms (training aids). **Lower = better; this picks the best epoch.** |
+| **val objective** | `λ_E · E_MAE/σ_E + λ_W · (center MAE + radius_weight · radius MAE/r_std)`, on the **selected** centers (top logits with NMS, exactly as at prediction time). It uses mean absolute errors whatever the training loss forms (`l1`/`mse`), so sweep runs that differ in loss form are comparable (σ_E and r_std come from the shared train split). **Lower = better; this picks the best epoch.** |
 | `E-MAE` | validation energy error, eV |
 | `center up/down` | per-spin matched center error, Å |
 | `radius` | matched radius error, Å |
 
 The line looks like:
 ```
-epoch   40  lr 9.71e-04  train 0.4123 (E 0.0210  W 0.3913 = pos 0.3101 A^2, radius 0.6012, select 0.0950, guide 0.2210) | val obj 0.3811  E-MAE 0.1512 eV  center up/down 0.2101/0.2098 A  radius 0.0412 A  * new best  (63.2s)
+epoch   40  lr 9.71e-04  train 0.4123 (E 0.0210  W 0.3913 = pos 0.3101, radius 0.6012, select 0.0950, guide 0.2210) | val obj 0.3811  E-MAE 0.1512 eV  center up/down 0.2101/0.2098 A  radius 0.0412 A  * new best  (63.2s)
 ```
 - `* new best`: the validation objective improved, so the parameters are saved as the best.
+- **Which parameters:** validation, `params.msgpack` and the returned model use an exponential
+  moving average (EMA) of the weights, `ema ← d·ema + (1−d)·weights` after every step
+  (`train.ema_decay`, default 0.99; 0 = the raw weights). Averaging over the last ~100 steps
+  smooths out step-to-step noise; NequIP and MACE validate and ship their EMA weights the same way
+  ([refs](refs.md)). Training itself continues from the raw weights; both are saved in
+  `params.last.msgpack`, so resume stays exact.
 - **Early stopping** (`train.patience`, 0 = off): after `patience` validations in a row without
   a new best, training stops (`early stop: no improvement for N evaluations (best @ epoch E)`).
   The best parameters are already on disk, so nothing is lost.

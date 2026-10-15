@@ -8,6 +8,9 @@ model:
     enabled: true
     n_basis: 16
     cutoff: 10.0           # Angstrom; only sets RBF support, NOT a graph cutoff (§3)
+  update_coords: true        # EGNN coordinate updates (false = x stays at the input positions,
+                             #   EGNN's QM9 setting)
+  edge_gate: false           # EGNN soft edge gate m_ij *= sigmoid(.) ("attention")
 
 wannier:
   max_centers: 28          # pads the TRUE centers per spin (≥ the largest molecule's count)
@@ -19,8 +22,12 @@ wannier:
   select_weight: 1.0       # weight of the candidate-selection term (BCE: matched -> 1)
   singles_per_atom: 2      # candidate centers each atom proposes per spin (model/heads.py)
   pairs_per_atom: 1        # ± candidate pairs per atom per spin (off-plane centers)
+  position_loss: l1        # l1 = mean distance (robust to a few far pairs) | mse = squared
+  nms_radius: 0.3          # A; selected centers closer than this are merged (true spacing
+                           #   >= 0.48 A); candidates this close to a matched one are positives
 
 loss:
+  energy_loss: l1           # l1 = |dE|/sigma_E (normalized, EGNN's QM9 recipe) | mse = dE^2 in eV^2
   lambda_energy: 1.0
   lambda_wannier: 1.0
 
@@ -34,6 +41,7 @@ train:
   epochs: 300
   ckpt_every: 5            # checkpoint + val eval every N epochs (survives wall-kill, auto-resumes)
   patience: 0               # early stop after N validations without a new best (0 = off)
+  ema_decay: 0.99           # weights used for validation/checkpoints = moving average (0 = off)
   seed: 0                   # initialization + batch order
   split_seed: 0             # train/val/test split (keep fixed so runs share one test set)
   val_frac: 0.1

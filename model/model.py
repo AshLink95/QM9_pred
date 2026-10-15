@@ -22,6 +22,8 @@ class QM9Model(nn.Module):
     n_spins: int
     singles_per_atom: int = 2       # Wannier candidates per atom and spin (model/heads.py)
     pairs_per_atom: int = 1         # ± candidate pairs per atom and spin
+    update_coords: bool = True      # EGNN coordinate updates (False = EGNN's QM9 setting)
+    edge_gate: bool = False         # EGNN soft edge gate ("attention")
     rbf_enabled: bool = True
     n_basis: int = 16
     cutoff: float = 10.0
@@ -33,7 +35,8 @@ class QM9Model(nn.Module):
         h = ElementEmbedding(self.n_elements, self.hidden_dim)(z)
         x = pos
         h, x = EGNNBackbone(self.hidden_dim, self.n_layers, self.rbf_enabled,
-                            self.n_basis, self.cutoff)(h, x)
+                            self.n_basis, self.cutoff, self.update_coords,
+                            self.edge_gate)(h, x)
         # E = sum_i ref[Z_i] + sum_i MLP(h_i). The per-element offset absorbs the huge
         # (~1e3 eV) scale of SIESTA total energies so the network only learns the eV-scale
         # residual — raw targets made the loss ~1e12 and training diverged. Still a sum over
@@ -67,6 +70,8 @@ def model_from_config(cfg: dict, atom_ref: tuple | None = None,
         n_spins=len(w["spins"]),
         singles_per_atom=w.get("singles_per_atom", 2),
         pairs_per_atom=w.get("pairs_per_atom", 1),
+        update_coords=m.get("update_coords", True),
+        edge_gate=m.get("edge_gate", False),
         rbf_enabled=m["rbf"]["enabled"],
         n_basis=m["rbf"]["n_basis"],
         cutoff=m["rbf"]["cutoff"],

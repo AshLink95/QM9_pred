@@ -40,6 +40,8 @@ class EGNNLayer(nn.Module):
     rbf_enabled: bool = True
     n_basis: int = 16
     cutoff: float = 10.0
+    update_coords: bool = True    # False: x stays at the input positions (EGNN's QM9 setting)
+    edge_gate: bool = False       # True: m_ij *= sigmoid(φ_g(m_ij)) (EGNN's "attention")
 
     @nn.compact
     def __call__(self, h: jnp.ndarray, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -57,6 +59,8 @@ class EGNNLayer(nn.Module):
         hj = jnp.broadcast_to(h[None, :, :], (n, n, H))
         edge_in = jnp.concatenate([hi, hj, radial], axis=-1)
         m_ij = _mlp([H, H], "phi_e")(edge_in)           # [N,N,H]
+        if self.edge_gate:                              # soft edge weight, an invariant scalar
+            m_ij = m_ij * nn.sigmoid(nn.Dense(1, name="phi_g")(m_ij))
 
         # zero out self-edges (i==j) so they contribute to neither aggregate
         off_diag = (1.0 - jnp.eye(n))[..., None]
@@ -70,8 +74,9 @@ class EGNNLayer(nn.Module):
         # Stabilized as in the EGNN reference code: unit-ish direction diff/(dist+1) and a
         # tanh-bounded weight, so one layer moves x by at most ~1 A (unbounded x exploded
         # in training). Still vector * invariant scalar -> equivariance unchanged.
-        w = jnp.tanh(_mlp([H, 1], "phi_x")(m_ij))       # [N,N,1] invariant, in (-1,1)
-        x = x + jnp.sum(diff / (dist[..., None] + 1.0) * w, axis=1) / (n - 1 + 1e-9)
+        if self.update_coords:
+            w = jnp.tanh(_mlp([H, 1], "phi_x")(m_ij))   # [N,N,1] invariant, in (-1,1)
+            x = x + jnp.sum(diff / (dist[..., None] + 1.0) * w, axis=1) / (n - 1 + 1e-9)
         return h, x
 
 
@@ -81,10 +86,12 @@ class EGNNBackbone(nn.Module):
     rbf_enabled: bool = True
     n_basis: int = 16
     cutoff: float = 10.0
+    update_coords: bool = True
+    edge_gate: bool = False
 
     @nn.compact
     def __call__(self, h: jnp.ndarray, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         for _ in range(self.n_layers):
             h, x = EGNNLayer(self.hidden_dim, self.rbf_enabled, self.n_basis,
-                             self.cutoff)(h, x)
+                             self.cutoff, self.update_coords, self.edge_gate)(h, x)
         return h, x

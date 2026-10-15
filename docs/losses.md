@@ -17,8 +17,15 @@ def energy_loss(pred_energy, true_energy):
     return jnp.mean((pred_energy - true_energy) ** 2)
 ```
 
-Plain mean-squared error on one invariant scalar. (Training computes the same thing inline over
-a batch in `training/train.py:_batch_loss`.)
+Plain mean-squared error on one invariant scalar — the simplest form. Training uses
+`training/train.py:_energy_loss`, chosen by `loss.energy_loss`:
+- **`l1` (default):** `mean |ΔE| / σ_E`, where σ_E is the training set's energy spread left after
+  the per-element reference (printed at startup). This is EGNN's QM9 recipe (L1 loss on
+  normalized targets, [refs](refs.md)). Two reasons: it scores what we report (mean absolute
+  error), and it keeps the energy term on the same scale as the Wannier terms.
+- **`mse`:** `mean ΔE²` in eV² (the earlier loss). Its trouble: at 0.05 eV error it is 0.0025,
+  next to a Wannier term of ~0.4, and it shrinks quadratically as the energy improves, so late
+  in training the energy gets almost no gradient.
 
 ## 2. The problem: comparing two unordered sets
 
@@ -76,21 +83,30 @@ loss = wannier_match_loss(..., k, perm, ...)          # jitted, on the GPU
 ```python
 mc  = take_along_axis(pred_c, perm)                  # predicted center paired with each true one
 mr  = take_along_axis(pred_r, perm)
-pos = Σ mask·‖true_c − mc‖² / n                      # Å²
+pos = Σ mask·‖true_c − mc‖ / n                       # Å (l1, default) — or ‖·‖² (mse)
 rad = Σ mask·((true_r − mr) / r_std)² / n            # dimensionless
-select = mean BCE(logit, chosen)                     # chosen = 1 if matched, else 0
+select = mean BCE(logit, chosen)        # chosen = 1 if matched or within nms_radius of a match
 guide = mean over (molecule, spin) of cloud_l2(matched, true)/k   # fixed width, unit amplitudes
 total = pos + radius_weight·rad + select_weight·select + guide_weight·guide
 ```
 - `mask[b,s,i] = i < k[b,s]`: only real centers count, and `n` is how many there are.
-- **Position** is plain squared error on matched pairs. That's sharp: it keeps pushing until each
-  center sits on its partner.
+- **Position** (`wannier.position_loss`): `l1` (default) is the distance itself, smoothed at 0
+  (`sqrt(d² + 10⁻⁶)`, a "Charbonnier" loss); `mse` is the squared distance. With the square, one
+  misassigned pair 2 Å off weighs 400× a 0.1 Å pair, so the few far pairs steer the gradient; with
+  the distance it is 20×, and the many nearly-right centers keep getting sharpened (DETR also uses
+  an L1 box loss).
 - **Radius** is regressed directly per matched pair, divided by the dataset's radius std
   (`r_std`, measured on the train split at startup). The head's radius output starts at the
   dataset mean ([model](model.md) §5), so training starts at "constant guess" quality.
-- **Selection** is binary cross-entropy on every candidate's logit: 1 if the matching chose it,
-  0 otherwise. At prediction time the `k` highest logits are the centers
-  (`model/heads.py:select_centers`). It is classification only — no amplitude or width ever
+- **Selection** is binary cross-entropy on every candidate's logit
+  (`selection_targets`): 1 if the matching chose it **or it lies within `nms_radius` of a chosen
+  one**, 0 otherwise. At prediction time the highest logits are taken, skipping near-duplicates
+  (NMS, [model](model.md) §5), until `k` centers are chosen. Why the radius: a center on a
+  symmetry element — the midpoint of a symmetric C–C bond — is approached by identical candidates
+  from both carbons. Their features are equal, so their logits must be equal; one-to-one targets
+  would tell one twin "yes" and the other "no" for the same input. Making both positives and
+  letting NMS keep one is consistent ("NMS Strikes Back", [refs](refs.md)). A ± pair counts as
+  positive only if both its members do. It is classification only — no amplitude or width ever
   enters an overlap — so it can't be used to blur (the first loss's failure).
   **Validation, the report and `main.py` score the selected candidates**, never a match over all
   `C` (that would flatter the numbers: with 4 candidates per atom, something is always close).

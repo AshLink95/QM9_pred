@@ -156,11 +156,22 @@ def _prefetch(items, make, depth=2):
 
 
 # ------------------------------------------------------------------ loss
-def _batch_loss(params, model, batch, perm, lam_e, lam_w, wkw):
-    """λ_E·energy MSE + λ_W·(matched Wannier loss, per spin). `perm` comes from the host
-    pairing; `wkw` holds r_std and the config weights (python floats)."""
+def _energy_loss(pred, true, ekw):
+    """"l1": mean |ΔE|/σ_E (σ_E = train residual std after the per-element reference; EGNN's
+    QM9 recipe trains on L1 of normalized targets). "mse": mean ΔE² in eV² (the earlier loss; its
+    weight shrinks quadratically as the energy improves)."""
+    if ekw["form"] == "l1":
+        return jnp.mean(jnp.abs(pred - true)) / ekw["e_std"]
+    if ekw["form"] == "mse":
+        return jnp.mean((pred - true) ** 2)
+    raise ValueError(f"loss.energy_loss must be 'l1' or 'mse', got {ekw['form']!r}")
+
+
+def _batch_loss(params, model, batch, perm, lam_e, lam_w, wkw, ekw):
+    """λ_E·energy loss + λ_W·(matched Wannier loss, per spin). `perm` comes from the host
+    pairing; `wkw`/`ekw` hold the Wannier/energy loss settings (python values)."""
     out = jax.vmap(lambda z, p: model.apply(params, z, p))(batch["z"], batch["pos"])
-    e = jnp.mean((out["energy"] - batch["energy"]) ** 2)
+    e = _energy_loss(out["energy"], batch["energy"], ekw)
     zero = jnp.zeros(())
     w, parts = zero, {"pos": zero, "radius": zero, "select": zero, "guide": zero}
     if lam_w > 0:
@@ -210,17 +221,21 @@ def make_lr(tc, spe):
 
 
 # ------------------------------------------------------------------ validation
-def _validate(fwd, params, buckets, examples, put, spins, lam_e, lam_w, wkw, batch_size, pool):
-    """Predict every validation molecule once, keep the k top-scoring candidates per spin (as
-    at prediction time), pair them with the truth on the host, and compute the val objective
-    (energy + matched position/radius terms; no guide or selection term) plus readable
-    metrics."""
+def _validate(fwd, params, buckets, examples, put, spins, lam_e, lam_w, wkw, ekw, batch_size,
+              pool):
+    """Predict every validation molecule once, select k centers per spin exactly as at
+    prediction time (top logits + NMS), pair them with the truth on the host, and compute:
+
+        objective = λ_E·E_MAE/σ_E + λ_W·(center MAE + radius_weight·radius MAE/r_std)
+
+    It doesn't depend on the loss forms (l1/mse), so runs that differ only in those are compared
+    on the same scale (σ_E, r_std come from the shared train split). Lower is better."""
     S = len(spins)
     e_err, jobs = [], []
     for n, idx, real in eval_batches(buckets, batch_size):
         b = _gather(buckets, n, idx)
         out = jax.device_get(fwd(params, put(b["z"]), put(b["pos"])))
-        sel = select_centers(out["wannier"])
+        sel = select_centers(out["wannier"], b["k"], wkw["nms_radius"])
         for j in range(real):
             ex = examples[buckets[n]["index"][idx[j]]]
             e_err.append(float(out["energy"][j]) - float(ex["energy"]))
@@ -233,9 +248,10 @@ def _validate(fwd, params, buckets, examples, put, spins, lam_e, lam_w, wkw, bat
     d = {s: np.array([p[2] for ss, m in matches if ss == s for p in m["pairs"]]) for s in range(S)}
     rerr = np.array([p[3] for _, m in matches for p in m["pairs"]])
     alld = np.concatenate([d[s] for s in range(S)])
-    pos_mse = float(np.mean(alld ** 2)) if len(alld) else 0.0
-    rad_mse = float(np.mean((rerr / wkw["r_std"]) ** 2)) if len(rerr) else 0.0
-    obj = lam_e * float(np.mean(e_err ** 2)) + lam_w * (pos_mse + wkw["radius_weight"] * rad_mse)
+    c_mae = float(np.mean(alld)) if len(alld) else 0.0
+    r_mae = float(np.mean(np.abs(rerr))) if len(rerr) else 0.0
+    obj = (lam_e * float(np.mean(np.abs(e_err))) / ekw["e_std"]
+           + lam_w * (c_mae + wkw["radius_weight"] * r_mae / wkw["r_std"]))
     return {
         "objective": obj,
         "energy_mae": float(np.mean(np.abs(e_err))),
@@ -334,9 +350,16 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
     r_mean, r_std = _fit_radius(train_ex)
     print(f"Wannier radius: mean {r_mean:.4f} A, std {r_std:.4f} A  (radius output starts at "
           f"the mean)", flush=True)
+    layout = (wc.get("singles_per_atom", 2), wc.get("pairs_per_atom", 1))
     wkw = {"r_std": r_std, "guide_sigma": wc["guide_sigma"],
            "radius_weight": wc["radius_weight"], "guide_weight": wc["guide_weight"],
-           "select_weight": wc.get("select_weight", 1.0)}
+           "select_weight": wc.get("select_weight", 1.0),
+           "position_loss": wc.get("position_loss", "mse"),
+           "nms_radius": wc.get("nms_radius", 0.0), "layout": layout}
+    ekw = {"form": cfg["loss"].get("energy_loss", "mse"), "e_std": max(resid_std, 1e-6)}
+    ema_decay = float(tc.get("ema_decay", 0.0))
+    print(f"losses: energy {ekw['form']}, positions {wkw['position_loss']}, NMS radius "
+          f"{wkw['nms_radius']} A, EMA decay {ema_decay}", flush=True)
 
     model = model_from_config(cfg, atom_ref=atom_ref, radius_init=r_mean)
     params = model.init(jax.random.PRNGKey(tc["seed"]),
@@ -348,7 +371,7 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
           f"{tc['epochs']} epochs)", flush=True)
 
     # ---- resume from the last full state, if compatible
-    state = {"params": params, "opt_state": opt_state, "epoch": np.int64(0),
+    state = {"params": params, "ema": params, "opt_state": opt_state, "epoch": np.int64(0),
              "best_obj": np.float64(np.inf), "best_epoch": np.int64(-1),
              "evals_since_best": np.int64(0)}
     best_params = params
@@ -371,14 +394,15 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
             elif loaded is not None:
                 print(f"WARNING: {last_p} contains NaN/inf — starting fresh", flush=True)
     params = jax.device_put(state["params"], repl)
+    ema = jax.device_put(state["ema"], repl)           # what is validated, saved and returned
     opt_state = jax.device_put(state["opt_state"], repl)
     if int(state["best_epoch"]) < 0:
-        best_params = params
+        best_params = ema
 
     def save_state(next_epoch):
         if not ckpt_path:
             return
-        st = {**state, "params": params, "opt_state": opt_state,
+        st = {**state, "params": params, "ema": ema, "opt_state": opt_state,
               "epoch": np.int64(next_epoch)}
         _atomic_write(_paths(ckpt_path)[1], serialization.to_bytes(jax.device_get(st)))
 
@@ -386,11 +410,15 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
     fwd = jax.jit(lambda prm, z, pos: jax.vmap(lambda zz, pp: model.apply(prm, zz, pp))(z, pos),
                   out_shardings=data_sh)
 
-    def _step(prm, ost, batch, perm):
+    def _step(prm, ema_, ost, batch, perm):
         (loss, aux), grads = jax.value_and_grad(_batch_loss, has_aux=True)(
-            prm, model, batch, perm, lam_e, lam_w, wkw)
+            prm, model, batch, perm, lam_e, lam_w, wkw, ekw)
         updates, ost = opt.update(grads, ost, prm)
-        return optax.apply_updates(prm, updates), ost, loss, aux
+        prm = optax.apply_updates(prm, updates)
+        # exponential moving average of the weights (decay 0 -> the weights themselves)
+        ema_ = jax.tree_util.tree_map(lambda e, p: ema_decay * e + (1.0 - ema_decay) * p,
+                                      ema_, prm)
+        return prm, ema_, ost, loss, aux
     step = jax.jit(_step, out_shardings=repl)
 
     workers = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
@@ -406,12 +434,12 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         def pairing(host, out_centers):
             return put(assign(np.asarray(out_centers), host["centers"], host["k"], pool,
-                              layout=(wc.get("singles_per_atom", 2), wc.get("pairs_per_atom", 1))))
+                              layout=layout))
 
         epoch = int(state["epoch"])
         while epoch < tc["epochs"]:
             t0 = time.time()
-            start_params, start_opt = params, opt_state
+            start_params, start_ema, start_opt = params, ema, opt_state
             rng = np.random.default_rng([tc["seed"], epoch])
             batches = _prefetch(epoch_batches(train_b, B, rng), make_batch)
             records, stopped = [], False
@@ -421,7 +449,8 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
             for nxt in _chain(batches):
                 if nxt is not None and lam_w > 0:   # predict NEXT batch with current params...
                     nxt_out = fwd(params, nxt[1]["z"], nxt[1]["pos"])
-                params, opt_state, loss, aux = step(params, opt_state, cur[1], perm)  # ...train
+                params, ema, opt_state, loss, aux = step(params, ema, opt_state, cur[1],
+                                                         perm)                       # ...train
                 records.append((loss, aux))
                 if should_stop():
                     stopped = True
@@ -441,7 +470,7 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
                 print(f"NON-FINITE loss at epoch {epoch} step {bad}: E-loss {float(a['E']):.3e}  "
                       f"W-loss {float(a['W']):.3e} — reverting to the epoch-start state and "
                       f"stopping", flush=True)
-                params, opt_state = start_params, start_opt
+                params, ema, opt_state = start_params, start_ema, start_opt
                 save_state(epoch)
                 status = "diverged"
                 break
@@ -456,11 +485,11 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
                 mean = lambda key: float(np.mean([float(a[key]) for _, a in vals]))
                 line = (f"epoch {epoch:4d}  lr {lr_at((epoch + 1) * spe):.2e}  train "
                         f"{losses.mean():.4f} (E {mean('E'):.4f}  W {mean('W'):.4f} = pos "
-                        f"{mean('pos'):.4f} A^2, radius {mean('radius'):.4f}, select "
+                        f"{mean('pos'):.4f}, radius {mean('radius'):.4f}, select "
                         f"{mean('select'):.4f}, guide {mean('guide'):.4f})")
                 if val_b:
-                    v = _validate(fwd, params, val_b, val_ex, put, spins, lam_e, lam_w, wkw, B,
-                                  pool)
+                    v = _validate(fwd, ema, val_b, val_ex, put, spins, lam_e, lam_w, wkw, ekw,
+                                  B, pool)
                     centers = "/".join(f"{x:.4f}" for x in v["center_mae"].values())
                     line += (f" | val obj {v['objective']:.4f}  E-MAE {v['energy_mae']:.4f} eV  "
                              f"center {'/'.join(spins)} {centers} A  radius "
@@ -468,11 +497,11 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
                     if v["objective"] < float(state["best_obj"]):
                         state.update(best_obj=np.float64(v["objective"]),
                                      best_epoch=np.int64(epoch), evals_since_best=np.int64(0))
-                        best_params = params
+                        best_params = ema
                         line += "  * new best"
                         if ckpt_path:
                             out_p, _, best_p = _paths(ckpt_path)
-                            _atomic_write(out_p, serialization.to_bytes(jax.device_get(params)))
+                            _atomic_write(out_p, serialization.to_bytes(jax.device_get(ema)))
                             best_p.write_text(json.dumps({"epoch": epoch, **v}, indent=2))
                     else:
                         state["evals_since_best"] = np.int64(int(state["evals_since_best"]) + 1)
@@ -494,9 +523,9 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
             epoch += 1
 
     if not val_b:                                    # nothing to select on: keep the last
-        best_params = params
+        best_params = ema
         if ckpt_path:
-            _atomic_write(_paths(ckpt_path)[0], serialization.to_bytes(jax.device_get(params)))
+            _atomic_write(_paths(ckpt_path)[0], serialization.to_bytes(jax.device_get(ema)))
     return jax.device_get(best_params), status
 
 

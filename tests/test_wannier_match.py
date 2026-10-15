@@ -140,3 +140,45 @@ def test_pairs_used_whole():
     tc2 = np.array([[0.0, 0, 0.4], [0, 0, -0.4]])                    # an off-plane pair of targets
     pc2 = np.array([[3.0, 0, 0], [5, 5, 5], [0, 0, 0.4], [0, 0, -0.4]])
     assert sorted(_assign_one(pc2, tc2, 2, sib)) == [2, 3]           # both members used together
+
+
+def test_position_loss_l1_known_value():
+    tc, tr = _truth()
+    pc, pr = _shuffled_prediction(tc, tr)
+    perm = assign(pc, tc, K)
+    _, parts = wannier_match_loss(jnp.asarray(pc + np.array([0.1, 0, 0])), jnp.asarray(pr),
+                                  jnp.zeros((B, S, M)), jnp.asarray(tc), jnp.asarray(tr),
+                                  jnp.asarray(K), jnp.asarray(perm), **KW, position_loss="l1")
+    assert abs(float(parts["pos"]) - 0.1) < 1e-4                     # mean distance, Å
+
+
+def test_selection_targets_nms():
+    """Twins near a matched candidate are positives too (NMS keeps one at prediction); far
+    candidates stay negatives; radius 0 reproduces one-to-one targets; a ± pair is positive only
+    if both members are."""
+    from losses.wannier_match import selection_targets
+    # 1 molecule, 1 spin, 1 true center; candidates (one atom, layout 2 singles + 1 pair):
+    # matched single 0, its twin 1 (0.05 Å away), pair 2/3 (+/- 0.6 Å, far)
+    pc = jnp.asarray([[[[0.0, 0, 0], [0.05, 0, 0], [0, 0, 0.6], [0, 0, -0.6]]]])
+    perm = jnp.zeros((1, 1, 1), jnp.int32)
+    mask = jnp.ones((1, 1, 1))
+    mc = pc[:, :, :1]
+    t1 = selection_targets(pc, mc, mask, perm, 0.3, layout=(2, 1))
+    assert np.asarray(t1).tolist() == [[[1, 1, 0, 0]]]
+    t0 = selection_targets(pc, mc, mask, perm, 0.0, layout=(2, 1))
+    assert np.asarray(t0).tolist() == [[[1, 0, 0, 0]]]
+    # a pair with only its "+" member near the matched center is not a positive
+    pc2 = pc.at[0, 0, 2].set(jnp.asarray([0.1, 0, 0]))
+    t2 = selection_targets(pc2, mc, mask, perm, 0.3, layout=(2, 1))
+    assert np.asarray(t2).tolist() == [[[1, 1, 0, 0]]]
+
+
+def test_select_centers_nms():
+    """Coincident twins (equal logits) count once; the next candidate fills the slot."""
+    from model.heads import select_centers
+    c = np.array([[[0.0, 0, 0], [0.02, 0, 0], [1.0, 0, 0], [2.0, 0, 0]]])     # [S=1, C=4, 3]
+    w = {"centers": c, "radii": np.ones((1, 4)), "logits": np.array([[3.0, 3.0, 2.0, 1.0]])}
+    plain = select_centers(w)["centers"][0, :2]
+    assert np.abs(plain[0] - plain[1]).max() < 0.05                  # duplicate kept twice
+    nms = select_centers(w, np.array([2]), 0.3)["centers"][0, :2]
+    np.testing.assert_allclose(nms, c[0, [0, 2]])                    # one twin + the next one

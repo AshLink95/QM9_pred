@@ -118,16 +118,41 @@ class WannierHead(nn.Module):
         return {"centers": flat(centers), "radii": flat(radii), "logits": flat(logits)}
 
 
-def select_centers(wannier):
-    """Order each spin's candidates by selection logit, highest first (host-side, NumPy).
+def _nms_order(c, order, k, radius):
+    """Greedy non-maximum suppression for one (molecule, spin): walk `order` (highest logit
+    first), keep a candidate unless it lies within `radius` of one already kept, stop at k.
+    Returns the kept indices followed by every other index (still in logit order)."""
+    kept = []
+    for i in order:
+        if len(kept) == k:
+            break
+        if not kept or np.min(np.sum((c[kept] - c[i]) ** 2, axis=-1)) > radius ** 2:
+            kept.append(i)
+    taken = set(kept)
+    return np.array(kept + [i for i in order if i not in taken])
+
+
+def select_centers(wannier, k=None, nms_radius=0.0):
+    """Order each spin's candidates so its first k are the predicted centers (host-side, NumPy).
 
     wannier: {centers[...,S,C,3], radii[...,S,C], logits[...,S,C]} (one molecule or a batch).
-    Returns {centers, radii} in that order: the first k = Σ valence/2 of a spin are its predicted
-    centers. Every consumer (validation, report, main.py) goes through this, so predictions are
-    always the selected candidates, never an oracle match over all of them.
-    # ponytail: candidates tied at the k-th place (equal logits, e.g. the two members of a pair)
-    # are cut by index order; a trained model rarely leaves a tie exactly at the boundary.
+    Candidates are taken by selection logit, highest first. With `k` ([...,S], Σ valence/2) and
+    `nms_radius` > 0, a candidate within `nms_radius` Å of one already taken is skipped
+    (non-maximum suppression): a center sitting on a symmetry element is approached by identical
+    candidates from the atoms the symmetry swaps, and an exactly equivariant model can't keep just
+    one of them, so duplicates are merged here. Decisions use only logits and distances, so the
+    selected set transforms with the molecule. Every consumer (validation, report, main.py) goes
+    through this, so predictions are always the selected candidates, never an oracle match.
+    # ponytail: candidates tied at the k-th place (equal logits, not coincident) are cut by index
+    # order; a trained model rarely leaves a tie exactly at the boundary.
     """
+    centers, radii = np.asarray(wannier["centers"]), np.asarray(wannier["radii"])
     order = np.argsort(-np.asarray(wannier["logits"]), axis=-1, kind="stable")
-    return {"centers": np.take_along_axis(np.asarray(wannier["centers"]), order[..., None], -2),
-            "radii": np.take_along_axis(np.asarray(wannier["radii"]), order, -1)}
+    if k is not None and nms_radius > 0:
+        C = order.shape[-1]
+        flat_o, flat_c = order.reshape(-1, C), centers.reshape(-1, C, 3)
+        flat_k = np.broadcast_to(np.asarray(k), order.shape[:-1]).reshape(-1)
+        order = np.stack([_nms_order(c, o, int(kk), nms_radius)
+                          for c, o, kk in zip(flat_c, flat_o, flat_k)]).reshape(order.shape)
+    return {"centers": np.take_along_axis(centers, order[..., None], -2),
+            "radii": np.take_along_axis(radii, order, -1)}

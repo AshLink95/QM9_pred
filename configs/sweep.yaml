@@ -2,10 +2,12 @@
 # from this list until none are left. Editing this file later only ADDS new runs; existing runs
 # (by name) are never duplicated or changed.
 
-# v3: the per-atom candidate Wannier head (model/heads.py). v2 (global slots) finished; its runs
-# stay in runs/wannier_v2/ and its plan is in git history. This file is self-contained: `base`
-# below is the full run config (a copy of configs/gpu.yaml), so nothing else is read.
-name: wannier_v3                # runs are written to runs/<name>/
+# v4: training recipe aimed at energy and the center mean/median (docs/refs.md, CLAUDE.md §6):
+# L1 losses (normalized energy, distance for centers), NMS selection + NMS-consistent targets,
+# EMA of weights. v3 (per-atom candidates, one-to-one targets, MSE losses) finished in
+# runs/wannier_v3/. This file is self-contained: `base` is the full run config (a copy of
+# configs/gpu.yaml), so nothing else is read.
+name: wannier_v4                # runs are written to runs/<name>/
 dataset: dataset.pkl            # read-only, shared by all runs
 stale_minutes: 30               # no-heartbeat fallback when squeue can't tell if an owner died
 
@@ -19,6 +21,9 @@ base:
       enabled: true
       n_basis: 16
       cutoff: 10.0
+    update_coords: true        # EGNN coordinate updates (false = x stays at the input positions,
+                               #   EGNN's QM9 setting)
+    edge_gate: false           # EGNN soft edge gate m_ij *= sigmoid(.) ("attention")
 
   wannier:
     max_centers: 28          # pads the TRUE centers per spin (≥ the largest molecule's count)
@@ -30,8 +35,12 @@ base:
     select_weight: 1.0       # weight of the candidate-selection term (BCE: matched -> 1)
     singles_per_atom: 2      # candidate centers each atom proposes per spin (model/heads.py)
     pairs_per_atom: 1        # ± candidate pairs per atom per spin (off-plane centers)
+    position_loss: l1        # l1 = mean distance (robust to a few far pairs) | mse = squared
+    nms_radius: 0.3          # A; selected centers closer than this are merged (true spacing
+                             #   >= 0.48 A); candidates this close to a matched one are positives
 
   loss:
+    energy_loss: l1           # l1 = |dE|/sigma_E (normalized, EGNN's QM9 recipe) | mse = dE^2 in eV^2
     lambda_energy: 1.0
     lambda_wannier: 1.0
 
@@ -45,6 +54,7 @@ base:
     epochs: 300
     ckpt_every: 5
     patience: 0               # early stop after N validations without a new best (0 = off)
+    ema_decay: 0.99           # weights used for validation/checkpoints = moving average (0 = off)
     seed: 0                   # initialization + batch order
     split_seed: 0             # train/val/test split (keep fixed so runs share one test set)
     val_frac: 0.1
@@ -55,17 +65,26 @@ stage1_overrides:
   train.epochs: 300
   train.patience: 6             # stop after 6 validations (30 epochs) without a new best
 
-# Stage 2: when every stage-1 run is finished/failed, the best one (lowest val objective) is
-# re-run as 'final' with these overrides: a long run on the full cosine schedule.
+# Stage 2: when every stage-1 run is finished/failed, the best one (lowest val objective; runs
+# with `promote: false` excluded) is re-run as 'final' with these overrides.
 stage2_overrides:
   train.epochs: 1000
   train.patience: 0
 
 # Stage-1 runs: seeds first (how much do results vary by chance?), then one change at a time.
+# The val objective doesn't depend on the loss forms, so all runs below are comparable.
 runs:
   - {name: base_s0, overrides: {train.seed: 0}}
   - {name: base_s1, overrides: {train.seed: 1}}
-  - {name: select_w0.3, overrides: {wannier.select_weight: 0.3}}   # weaker candidate selection
-  - {name: select_w3, overrides: {wannier.select_weight: 3.0}}     # stronger candidate selection
-  - {name: singles3, overrides: {wannier.singles_per_atom: 3}}     # more candidates per atom
-  - {name: pairs2, overrides: {wannier.pairs_per_atom: 2}}         # more ± pairs per atom
+  - {name: energy_mse, overrides: {loss.energy_loss: mse}}          # v3 energy loss
+  - {name: pos_mse, overrides: {wannier.position_loss: mse}}        # v3 position loss
+  - {name: nms0, overrides: {wannier.nms_radius: 0.0}}              # no NMS (v3 selection)
+  - {name: ema0, overrides: {train.ema_decay: 0.0}}                 # no weight averaging
+  - {name: ema0.999, overrides: {train.ema_decay: 0.999}}           # longer averaging
+  - {name: layers7, overrides: {model.n_layers: 7}}                 # EGNN's QM9 depth
+  - {name: batch96, overrides: {train.batch_size: 96}}              # EGNN's QM9 batch size
+  - {name: coords_fixed, overrides: {model.update_coords: false}}   # EGNN's QM9 setting
+  - {name: edge_gate, overrides: {model.edge_gate: true}}           # EGNN's edge attention
+  # diagnostic: energy alone, to measure what sharing the network with Wannier costs. Never
+  # promoted (its objective has no Wannier term, so it would always "win").
+  - {name: energy_only, promote: false, overrides: {loss.lambda_wannier: 0.0}}

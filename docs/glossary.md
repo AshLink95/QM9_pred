@@ -18,6 +18,7 @@ explanations: [physics_primer](physics_primer.md), [ml_primer](ml_primer.md),
 | **Bohr** | Atomic length unit, 0.529 Å. Appears only in parts of SIESTA's `.out` that we don't use. |
 | **Bucket** | All training molecules with the same number of atoms; batches are cut from buckets. |
 | **Candidate** | One proposed Wannier center: each atom proposes a few per spin (singles and ± pairs); the k with the highest selection logits are the prediction. |
+| **Charbonnier loss** | `sqrt(d² + ε²)`: the distance itself, smoothed at zero so it has a gradient everywhere; the default Wannier position loss (`wannier.position_loss: l1`). |
 | **Checkpoint** | Saved model parameters (`params.msgpack`); training resumes from it. |
 | **Chemical accuracy** | 1 kcal/mol ≈ 0.043 eV: the error level considered good for energy predictions. |
 | **Chiral** | A molecule that differs from its mirror image. |
@@ -35,6 +36,7 @@ explanations: [physics_primer](physics_primer.md), [ml_primer](ml_primer.md),
 | **Dipole moment** | A vector describing how charge is separated in a molecule; computable from nuclei + Wannier centers. |
 | **Early stopping** | Ending a run after `patience` validation checks without improvement; the best weights are already saved. |
 | **EGNN** | E(n)-equivariant graph neural network: the architecture, built so rotations/translations are respected exactly. |
+| **EMA (exponential moving average of weights)** | A running average of the weights, `avg ← d·avg + (1−d)·weights` after each step (`train.ema_decay`); validation and checkpoints use it. |
 | **Embedding** | A learned lookup table: one vector per element. |
 | **Epoch** | One pass over all training molecules. |
 | **Equivariant** | Transforms *with* the input: rotate the molecule and the Wannier centers rotate the same way. |
@@ -59,8 +61,10 @@ explanations: [physics_primer](physics_primer.md), [ml_primer](ml_primer.md),
 | **MLWF** | Maximally localized Wannier function: orbitals made as compact as possible (Wannier90). |
 | **MSE** | Mean squared error; used as the training loss for energy and positions. |
 | **NaN** | "Not a number": what a diverged training produces. The NaN guard stops and keeps the last good parameters. |
+| **NMS (non-maximum suppression)** | When choosing centers, skip a candidate that lies within `wannier.nms_radius` of one already chosen; merges duplicate predictions. |
 | **Noise floor** | The best error any model could reach given label noise; ~0.013 Å for Wannier centers here. |
 | **Objective (validation)** | The number that picks the best epoch: energy MSE plus the matched Wannier position and radius terms on validation molecules (lower is better). |
+| **One-to-many targets** | Training targets that mark every candidate near a true center as "yes" (not just the single matched one); consistent with NMS at prediction. |
 | **Open-shell** | Unpaired electrons (odd electron count); not supported. |
 | **Overfitting / underfitting** | Memorizing the training set vs. not fitting it well enough. |
 | **± pair** | Two candidates `b ± s·(u × v)` placed symmetrically about an atom's local plane, for centers above/below a flat molecule; always used together. |

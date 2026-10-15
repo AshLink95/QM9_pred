@@ -192,7 +192,9 @@ def maybe_promote(q, spec, force=False):
     states = {r["name"]: q.state_of(r["name"]) for r in spec["runs"]}
     if not force and any(s not in ("finished", "failed") for s in states.values()):
         return False
-    finished = [n for n, s in states.items() if s == "finished"]
+    # runs marked `promote: false` (diagnostics, e.g. energy only) are never promoted
+    eligible = {r["name"] for r in spec["runs"] if r.get("promote", True)}
+    finished = [n for n, s in states.items() if s == "finished" and n in eligible]
     if not finished:
         return False
     winner = min(finished, key=lambda n: best_val(q, n))

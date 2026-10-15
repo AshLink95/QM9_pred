@@ -122,3 +122,16 @@ def test_shipped_sweep_resolves():
     spec = sweep.load_sweep("configs/sweep.yaml")
     for run in spec["runs"]:
         sweep.stage1_config(spec, run)
+
+
+def test_promote_false_run_is_never_promoted(tmp_path):
+    """A diagnostic run (`promote: false`, e.g. energy only) is skipped even with the best score."""
+    _, spec = _spec(tmp_path, n_runs=2)
+    spec["runs"][1]["promote"] = False
+    q = sweep.RunQueue(sweep.sweep_root(spec))
+    sweep.init(q, spec)
+    for name, obj in (("r0", 0.5), ("r1", 0.01)):
+        q.move(name, "queued", "finished")
+        (q.root / name / "params.best.json").write_text(json.dumps({"objective": obj}))
+    assert sweep.maybe_promote(q, spec)
+    assert "r0" in (q.root / sweep.FINAL / "promoted_from.txt").read_text()

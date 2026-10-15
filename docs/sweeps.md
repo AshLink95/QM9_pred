@@ -101,11 +101,32 @@ molecules never influence any choice.
 
 All runs share `split_seed: 0`, so all are scored on the **same test molecules**.
 
-**Current plan: `wannier_v3`** (the per-atom candidate head, [model](model.md) §5). The sweep file
-is self-contained: its `base:` is the full run config written inline (a copy of
+The sweep file is self-contained: its `base:` is the full run config written inline (a copy of
 `configs/gpu.yaml`), so nothing outside it is read. (`base:` may also be a path to a config file.)
 Every override must name a key that exists in the base; a base written before a key was added
-fails at start-up with `no such config key`.
+fails at start-up with `no such config key`. A run with `promote: false` is never promoted to
+stage 2 (used for diagnostics whose objective isn't comparable, like energy only).
+
+**Current plan: `wannier_v4`** (training recipe aimed at energy and the center mean/median; the
+sources are in [refs](refs.md)). The base turns on L1 losses (normalized energy, distance for
+centers), NMS selection with NMS-consistent targets, and a weight EMA (0.99). Each run switches
+one of them off or tries one EGNN QM9 setting:
+
+| Runs | What changes | Question it answers |
+|---|---|---|
+| `base_s0`, `base_s1` | seed 0 / 1 | Run-to-run spread |
+| `energy_mse` | `loss.energy_loss: mse` (v3's) | Does L1 on normalized energy help? |
+| `pos_mse` | `wannier.position_loss: mse` (v3's) | Does the distance loss sharpen the median? |
+| `nms0` | `wannier.nms_radius: 0` (v3's) | Value of NMS selection + targets |
+| `ema0`, `ema0.999` | `train.ema_decay` 0 / 0.999 | Does weight averaging help, and how long? |
+| `layers7` | `model.n_layers: 7` | EGNN's QM9 depth |
+| `batch96` | `train.batch_size: 96` | EGNN's batch size (≈ 2.7× more steps per epoch) |
+| `coords_fixed` | `model.update_coords: false` | EGNN's QM9 setting (no coordinate updates) |
+| `edge_gate` | `model.edge_gate: true` | EGNN's edge attention |
+| `energy_only` | `loss.lambda_wannier: 0`, `promote: false` | How much does sharing the network with Wannier cost the energy? If it is far better, give energy its own model or more weight |
+
+**Previous plan: `wannier_v3`** (per-atom candidate head; `final` reached test energy 0.075 eV,
+centers 0.127 Å (median 0.056 Å), radius 0.011 Å):
 
 | Runs | What changes | Question it answers |
 |---|---|---|

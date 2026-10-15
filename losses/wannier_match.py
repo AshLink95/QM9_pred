@@ -11,9 +11,11 @@ few wide, faint blobs (test report: count 0.1%, center 0.61 Å, radius 0.22 Å).
     squared distance; rectangular, k <= C), and each pair's squared distance is minimized
     (DETR-style set loss; the pairing itself is not differentiated);
   * RADII: each matched candidate regresses its own true radius (normalized by the dataset std);
-  * SELECTION: binary cross-entropy on each candidate's logit, target 1 if it was matched, else 0.
-    At prediction time the k highest logits are the centers (model/heads.py:select_centers).
-    Pure classification: no amplitude or width enters any overlap, so it can't be used to blur;
+  * SELECTION: binary cross-entropy on each candidate's logit, target 1 if it was matched or lies
+    within `nms_radius` of a matched one (`selection_targets`), else 0. At prediction time the
+    k highest logits, with near-duplicates suppressed, are the centers
+    (model/heads.py:select_centers). Pure classification: no amplitude or width enters any
+    overlap, so it can't be used to blur;
   * GUIDE: the closed-form cloud overlap (losses/wannier_cloud.py) between the matched
     candidates and the truth, FIXED width, amplitude 1 per center — a smooth, order-free pull
     that steadies early training when pairings still flip.
@@ -96,28 +98,58 @@ def assign(pred_c, true_c, k, pool: ThreadPoolExecutor | None = None, layout=Non
     return np.stack(list(rows)).reshape(B, S, M)
 
 
+def selection_targets(pred_c, mc, mask, perm, nms_radius, layout=None):
+    """BCE target per candidate [B,S,C]: 1 if it is a matched candidate or lies within
+    `nms_radius` of one (one-to-many, consistent with NMS at prediction), else 0.
+
+    Why not one-to-one: a center sitting on a symmetry element is approached by identical
+    candidates from the atoms the symmetry swaps; one-to-one targets would give these twins 1 and
+    0 at once although their features are equal. With the radius they are both positives and
+    NMS (model/heads.py:select_centers) keeps one. A ± pair's members share one logit, so the
+    pair's target is the AND of its two members (`layout` = (singles, pairs))."""
+    C = pred_c.shape[2]
+    chosen = jnp.max(jax.nn.one_hot(perm, C, dtype=pred_c.dtype) * mask[..., None], axis=2)
+    if nms_radius > 0:
+        pc, mcs = jax.lax.stop_gradient(pred_c), jax.lax.stop_gradient(mc)
+        d2 = jnp.sum((pc[:, :, :, None, :] - mcs[:, :, None, :, :]) ** 2, axis=-1)   # [B,S,C,M]
+        near = jnp.any((d2 < nms_radius ** 2) & (mask[:, :, None, :] > 0), axis=-1)
+        chosen = jnp.maximum(chosen, near.astype(chosen.dtype))
+        if layout is not None:
+            sib = jnp.asarray(pair_siblings(C, *layout))
+            chosen = jnp.minimum(chosen, chosen[:, :, sib])
+    return chosen
+
+
 def wannier_match_loss(pred_c, pred_r, pred_l, true_c, true_r, k, perm, *, r_std, guide_sigma,
-                       radius_weight, guide_weight, select_weight):
+                       radius_weight, guide_weight, select_weight, position_loss="mse",
+                       nms_radius=0.0, layout=None):
     """Batched, per-spin Wannier loss.
 
     pred_c[B,S,C,3], pred_r[B,S,C], pred_l[B,S,C]: candidates from the head (center, radius,
     selection logit).  true_c[B,S,M,3], true_r[B,S,M]: parsed centers padded to M (first k
     real).  k[B,S]: real centers per spin (= Σ valence/2).  perm[B,S,M]: pairing from `assign`.
-    Returns (total, {"pos": Å², "radius": normalized, "select": BCE, "guide": per-center
-    overlap}).
+    position_loss: "l1" = mean distance (Charbonnier, Å; a few far, misassigned pairs can't
+    dominate the gradient) or "mse" = mean squared distance (Å²).
+    Returns (total, {"pos", "radius": normalized, "select": BCE, "guide": per-center overlap}).
     """
-    M, C = true_c.shape[2], pred_c.shape[2]
+    M = true_c.shape[2]
     mask = (jnp.arange(M)[None, None, :] < k[:, :, None]).astype(pred_c.dtype)   # [B,S,M]
     n = jnp.maximum(mask.sum(), 1.0)
 
     perm = jax.lax.stop_gradient(perm)
     mc = jnp.take_along_axis(pred_c, perm[..., None], axis=2)                    # matched xyz
     mr = jnp.take_along_axis(pred_r, perm, axis=2)                               # matched r
-    pos = jnp.sum(mask * jnp.sum((true_c - mc) ** 2, axis=-1)) / n
+    d2 = jnp.sum((true_c - mc) ** 2, axis=-1)
+    if position_loss == "l1":
+        pos = jnp.sum(mask * jnp.sqrt(d2 + 1e-6)) / n           # Charbonnier, eps = 1e-3 Å
+    elif position_loss == "mse":
+        pos = jnp.sum(mask * d2) / n
+    else:
+        raise ValueError(f"wannier.position_loss must be 'l1' or 'mse', got {position_loss!r}")
     rad = jnp.sum(mask * ((true_r - mr) / r_std) ** 2) / n
 
-    # selection: matched candidates -> 1, all others -> 0
-    target = jnp.max(jax.nn.one_hot(perm, C, dtype=pred_l.dtype) * mask[..., None], axis=2)
+    # selection: matched candidates (and their near-duplicates) -> 1, all others -> 0
+    target = selection_targets(pred_c, mc, mask, perm, nms_radius, layout)
     select = jnp.mean(optax.sigmoid_binary_cross_entropy(pred_l, target))
 
     # fixed-width cloud guide, one cloud per (molecule, spin), normalized per center
