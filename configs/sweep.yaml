@@ -2,10 +2,11 @@
 # from this list until none are left. Editing this file later only ADDS new runs; existing runs
 # (by name) are never duplicated or changed.
 
-# v4: training recipe aimed at energy and the center mean/median (docs/refs.md, CLAUDE.md §6):
-# L1 losses (normalized energy, distance for centers), NMS selection + NMS-consistent targets,
-# EMA of weights. v3 (per-atom candidates, one-to-one targets, MSE losses) finished in
-# runs/wannier_v3/. This file is self-contained: `base` is the full run config (a copy of
+# v4: Wannier-only model (energy removed, CLAUDE.md §1) with a recipe aimed at the center
+# mean/median (docs/refs.md, CLAUDE.md §6): L1 distance loss, NMS selection + NMS-consistent
+# targets, EMA of weights. v3 (energy + Wannier, one-to-one targets, MSE losses) finished in
+# runs/wannier_v3/. If runs/wannier_v4/ exists from the earlier energy+Wannier version of this
+# plan, delete it before launching. This file is self-contained: `base` is the full run config (a copy of
 # configs/gpu.yaml), so nothing else is read.
 name: wannier_v4                # runs are written to runs/<name>/
 dataset: dataset.pkl            # read-only, shared by all runs
@@ -39,11 +40,6 @@ base:
     nms_radius: 0.3          # A; selected centers closer than this are merged (true spacing
                              #   >= 0.48 A); candidates this close to a matched one are positives
 
-  loss:
-    energy_loss: l1           # l1 = |dE|/sigma_E (normalized, EGNN's QM9 recipe) | mse = dE^2 in eV^2
-    lambda_energy: 1.0
-    lambda_wannier: 1.0
-
   train:
     lr: 1.0e-3
     grad_clip: 1.0            # clip global grad norm (stability safety net)
@@ -66,7 +62,7 @@ stage1_overrides:
   train.patience: 6             # stop after 6 validations (30 epochs) without a new best
 
 # Stage 2: when every stage-1 run is finished/failed, the best one (lowest val objective; runs
-# with `promote: false` excluded) is re-run as 'final' with these overrides.
+# marked `promote: false` excluded) is re-run as 'final' with these overrides.
 stage2_overrides:
   train.epochs: 1000
   train.patience: 0
@@ -76,7 +72,6 @@ stage2_overrides:
 runs:
   - {name: base_s0, overrides: {train.seed: 0}}
   - {name: base_s1, overrides: {train.seed: 1}}
-  - {name: energy_mse, overrides: {loss.energy_loss: mse}}          # v3 energy loss
   - {name: pos_mse, overrides: {wannier.position_loss: mse}}        # v3 position loss
   - {name: nms0, overrides: {wannier.nms_radius: 0.0}}              # no NMS (v3 selection)
   - {name: ema0, overrides: {train.ema_decay: 0.0}}                 # no weight averaging
@@ -85,6 +80,3 @@ runs:
   - {name: batch96, overrides: {train.batch_size: 96}}              # EGNN's QM9 batch size
   - {name: coords_fixed, overrides: {model.update_coords: false}}   # EGNN's QM9 setting
   - {name: edge_gate, overrides: {model.edge_gate: true}}           # EGNN's edge attention
-  # diagnostic: energy alone, to measure what sharing the network with Wannier costs. Never
-  # promoted (its objective has no Wannier term, so it would always "win").
-  - {name: energy_only, promote: false, overrides: {loss.lambda_wannier: 0.0}}

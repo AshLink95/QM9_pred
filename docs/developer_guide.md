@@ -11,24 +11,22 @@ how to debug. Commands for running everything are in the top-level [README](../R
 
 | Path | What it is | Learns? |
 |---|---|---|
-| `data/parse_siesta.py` | reads `.fdf` (atoms, positions) and `.out` (energy) | no |
+| `data/parse_siesta.py` | reads `.fdf` (atoms, positions); the `.out` is not read | no |
 | `data/parse_wout.py` | reads `.wout` (Wannier centers, spreads) | no |
 | `data/dataset.py` | finds files by molecule id across folders, builds/loads `dataset.pkl`, the train/val/test split | no |
 | `data/electrons.py` | valence table; Wannier centers per spin = valence electrons / 2 | no |
 | `data/graph.py` | all-pairs graph (used by notebooks; the model recomputes distances itself) | no |
-| `data/units.py` | Å / Bohr / eV / Ry conversions | no |
+| `data/units.py` | Å / Bohr conversions | no |
 | `model/embeddings.py` | element → feature vector | **yes** |
 | `model/egnn.py` | the message-passing layers (the symmetry-preserving core) | **yes** |
-| `model/heads.py` | energy readout + per-atom Wannier candidates (center, radius, selection logit) per spin; `select_centers` | **yes** |
+| `model/heads.py` | per-atom Wannier candidates (center, radius, selection logit) per spin; `select_centers` (top logits + NMS) | **yes** |
 | `model/model.py` | assembles everything into `QM9Model`; `model_from_config` | **yes** |
 | `losses/wannier_match.py` | the Wannier loss: Hungarian-matched positions + radii + fixed-width guide, per spin | — |
 | `losses/wannier_cloud.py` | closed-form Gaussian-cloud overlap (the guide term) | — |
-| `losses/energy.py` | energy MSE (reference; training computes it inline) | — |
 | `training/train.py` | the training loop: precomputed batches, CPU/GPU pipeline, multi-GPU, LR schedule, validation, best/last checkpoints, resume, early stopping | — |
 | `training/sweep.py` | the parallel sweep: lock-free run queue, dead-job recovery, two stages | — |
-| `training/metrics.py` | evaluation metrics (energy MAE, Wannier matching) | — |
+| `training/metrics.py` | evaluation metrics (Wannier matching, center/radius errors) | — |
 | `training/report.py` | the accuracy report (CSVs, summary, figure) | — |
-| `training/loss.py` | small converter used by evaluation helpers | — |
 | `symmetry/transforms.py` | rotate / translate / mirror / permute, for the symmetry tests | — |
 | `scripts/build_dataset.py` | CLI: parse files → `dataset.pkl` | — |
 | `scripts/train.py` | CLI: config + `dataset.pkl` → `params.msgpack` | — |
@@ -84,11 +82,11 @@ Don't run full training on a laptop or shared login node: it takes ~1 hour on a 
 | Messages in `EGNNLayer` use only invariants (element features, distances) | otherwise rotation/translation symmetry breaks | [model](model.md) §4 "do NOT alter" |
 | Positions are only updated by relative vectors × plain numbers | same | [model](model.md) §2 |
 | Wannier candidates are built per atom from the equivariant track (`x_i + Σ_j α_ij r_ij`, ± pairs via `u × v`) | an ordinary MLP output can't rotate with the molecule; global slots collapse onto symmetry axes | [model](model.md) §5 |
-| Energy is a **sum** over atoms | energy must scale with molecule size | [model](model.md) §5 |
+| One objective per model: Wannier targets only, no energy term | energy and Wannier traded off in one network (negative transfer) | CLAUDE.md §1, [ml_primer](ml_primer.md) §10 |
 | The Wannier count is computed, never predicted; loss widths are fixed, never predicted | a model that controls these "games" the loss (measured) | [losses](losses.md) §2–3 |
 | Spins are never mixed in any loss or metric | up and down are separate physical sets | [losses](losses.md) §3 |
 | Everything tunable lives in `configs/` | reproducible experiments | `configs/*.yaml` |
-| Units: Å and eV inside the pipeline | conversions bite once, in `data/units.py` | [data](data.md) §1 |
+| Units: Å inside the pipeline | conversions bite once, in `data/units.py` | [data](data.md) §1 |
 | No `uv run` inside cluster jobs | it hangs offline | §2 |
 | The equivariance tests must pass on the **untrained** model | proves the symmetry is structural | [symmetry](symmetry.md) |
 
@@ -97,8 +95,7 @@ Don't run full training on a laptop or shared login node: it takes ~1 hour on a 
 ### 5a. Change a hyperparameter
 Edit or copy a file in `configs/`. Model size: `model.hidden_dim`, `model.n_layers`. Training:
 `train.lr`, `train.batch_size`, `train.epochs`, `train.grad_clip`. Loss balance:
-`loss.lambda_energy`, `loss.lambda_wannier`, `wannier.radius_weight`, `wannier.guide_weight`,
-`wannier.guide_sigma`. Point `scripts/train.sh` / `train-gpu.sh` (the `--config` line) at the
+`wannier.radius_weight`, `wannier.select_weight`, `wannier.guide_weight`, `wannier.guide_sigma`. Point `scripts/train.sh` / `train-gpu.sh` (the `--config` line) at the
 file. A model trained with a config must be **evaluated with the same config** (sizes and split
 seed come from it).
 
@@ -107,8 +104,10 @@ seed come from it).
 `constant`. The schedule spans `train.epochs`, so changing the epoch count changes the curve.
 `train.patience` > 0 enables early stopping. How to pick: [ml_primer](ml_primer.md) §14.
 
-### 5b. Energy-only run (sanity check or ablation)
-Use `configs/energy_only.yaml` (`lambda_wannier: 0`, which skips the Wannier loss entirely).
+### 5b. Want the energy back?
+Train it as a **separate model** (its own head, loss and checkpoint), not as a second term in
+this loss: the two traded off when they shared one network (CLAUDE.md §1). The pre-removal code
+(energy head with a per-element reference, L1 on the normalized energy) is in git history.
 
 ### 5c. Add a new element (e.g. sulfur)
 1. Add it to `VALENCE` in `data/electrons.py`; the value must equal the valence charge of the
@@ -138,7 +137,7 @@ failure the current design avoids.
 
 ### 5f. Read a new input file format
 Write a parser that returns the same example dict
-(`{z, pos, energy, wannier: [{centers, radii} per spin]}`, Å and eV). Nothing downstream changes.
+(`{z, pos, wannier: [{centers, radii} per spin]}`, Å). Nothing downstream changes.
 For prediction only, add a branch in `main.py` that turns the new file into `z, pos`.
 
 ### 5g. Add or change data
@@ -175,7 +174,7 @@ Keep both checkpoints and run `scripts.evaluate` for each with its own `--out-di
 | Test file | Guards |
 |---|---|
 | `test_equivariance.py` | **the symmetry guarantee** (rotate, translate, permute, mirror) on an untrained model |
-| `test_parsers.py` | `.fdf` / `.out` / `.wout` parsing on small synthetic files |
+| `test_parsers.py` | `.fdf` / `.wout` parsing on small synthetic files |
 | `test_electrons.py` | center count per spin; errors on unknown elements / odd electron counts |
 | `test_wannier_match.py` | the Wannier loss: zero on a reordered truth, known offsets, spin separation, more candidates than centers, selection target, pairs used whole, gradients |
 | `test_set_head.py` | the head can reach what global slots couldn't: methane's 4 C–H centers, off-plane centers of a planar molecule (one-molecule fits) |
@@ -208,7 +207,7 @@ number of centers). Use it for new tests.
 | sweep run in `failed` | exception during training/report | `runs/<sweep>/<run>/error.txt`, then `requeue` |
 | `evaluate`: params don't match config | evaluated with a different config than training | pass the training config |
 | `ValueError: no valence charge for element(s)` | new element | §5c |
-| Wannier error high but energy fine | loss balance, or a Wannier-loss regression | read the per-term epoch log; [losses](losses.md) failure table |
+| center error high, radius fine (or the reverse) | term balance, or a Wannier-loss regression | read the per-term epoch log; [losses](losses.md) failure table |
 
 ## 8. Cluster cheat sheet
 

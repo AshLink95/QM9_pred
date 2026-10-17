@@ -34,7 +34,7 @@ Entry points: `scripts/train.py` (one run, launched by `scripts/train.sh` / `tra
 - Training molecules whose parsed Wannier count differs from valence electrons / 2 are dropped
   with a warning (none expected).
 - Molecules are grouped by **atom count** and each group is stacked into NumPy arrays
-  (`z`, `pos`, `energy`, Wannier `centers`/`radii` padded to `max_centers`, the per-spin count
+  (`z`, `pos`, Wannier `centers`/`radii` padded to `max_centers`, the per-spin count
   `k`). About 120 MB for the full dataset.
 - Why group by atom count: a batch is one array, and arrays need equal shapes. Same atom count
   means no padding inside the model.
@@ -76,9 +76,9 @@ perm = pairing(next_batch, nxt_out["wannier"]["centers"])   # CPU, at the same t
 - No host callback sits inside compiled code, which keeps both programs cacheable on disk (§8).
 - Per-step losses stay on the device and are fetched **once per epoch**. Fetching every step
   would force the CPU to wait for the GPU each time.
-- `lambda_wannier: 0` (`energy_only.yaml`) skips `fwd` and the pairing entirely.
 
-`step` computes `λ_E · energy MSE + λ_W · Wannier loss` (`_batch_loss`), its gradient, clips it
+`step` computes the Wannier loss (`_batch_loss`; the only objective, [losses](losses.md) §1),
+its gradient, clips it
 (`train.grad_clip`), and applies Adam with the current learning rate.
 
 ## 4. Several GPUs — data parallelism
@@ -121,14 +121,13 @@ once, pairs centers on the host, and computes:
 
 | Value | Meaning |
 |---|---|
-| **val objective** | `λ_E · E_MAE/σ_E + λ_W · (center MAE + radius_weight · radius MAE/r_std)`, on the **selected** centers (top logits with NMS, exactly as at prediction time). It uses mean absolute errors whatever the training loss forms (`l1`/`mse`), so sweep runs that differ in loss form are comparable (σ_E and r_std come from the shared train split). **Lower = better; this picks the best epoch.** |
-| `E-MAE` | validation energy error, eV |
+| **val objective** | `center MAE + radius_weight · radius MAE / r_std`, on the **selected** centers (top logits with NMS, exactly as at prediction time). It uses mean absolute errors whatever the training loss form (`l1`/`mse`), so sweep runs that differ in loss form are comparable (r_std comes from the shared train split). **Lower = better; this picks the best epoch.** |
 | `center up/down` | per-spin matched center error, Å |
 | `radius` | matched radius error, Å |
 
 The line looks like:
 ```
-epoch   40  lr 9.71e-04  train 0.4123 (E 0.0210  W 0.3913 = pos 0.3101, radius 0.6012, select 0.0950, guide 0.2210) | val obj 0.3811  E-MAE 0.1512 eV  center up/down 0.2101/0.2098 A  radius 0.0412 A  * new best  (63.2s)
+epoch   40  lr 9.71e-04  train 0.4123 (pos 0.1101, radius 0.6012, select 0.0950, guide 0.2210) | val obj 0.2811  center up/down 0.1101/0.1098 A  radius 0.0112 A  * new best  (63.2s)
 ```
 - `* new best`: the validation objective improved, so the parameters are saved as the best.
 - **Which parameters:** validation, `params.msgpack` and the returned model use an exponential
@@ -194,8 +193,7 @@ and resubmission. Set `JAX_COMPILATION_CACHE_DIR=` (empty) to disable.
 | first epoch ~30 min, later seconds | one-time compilation | expected; the compile cache (§8) skips it next time |
 | `ShardingTypeError … out_sharding` | mesh created in Explicit mode | keep `axis_types=(AxisType.Auto,)` (§4) |
 | `LLVM compilation error: Cannot allocate memory` | too many distinct shapes | keep fixed-size batches (§2) |
-| E-loss huge, then NaN | energy reference removed | [model](model.md) §5 |
-| `NON-FINITE loss …` | divergence; the line shows which term | lower `lr`, check λ balance |
+| `NON-FINITE loss …` | divergence; the line shows the position and radius terms | lower `lr`, check the term weights |
 | val objective stops improving early | too high a learning rate, or real plateau | try `lr` 5e-4; cosine schedule; see [ml_primer](ml_primer.md) §12 |
 | `WARNING: … doesn't match this model` | `last` file from another architecture/config | expected after model changes; starts fresh |
 | only GPU 0 busy | `jax.devices()` sees one GPU | request `--gres=gpu:N`; check the `data-parallel over …` line |
@@ -208,4 +206,3 @@ and resubmission. Set `JAX_COMPILATION_CACHE_DIR=` (empty) to disable.
 4. Mesh + shardings (§4).
 5. `make_lr` (§5).
 6. `_validate`, best/last files, early stopping, resume, NaN guard, graceful stop (§6–7).
-7. Train `energy_only.yaml` first, then the full loss.

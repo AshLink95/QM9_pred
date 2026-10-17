@@ -19,7 +19,6 @@ def molecules(n, seed=0):
                      + [1] * int(rng.choice([2, 4])), dtype=np.int32)
         k = int(centers_per_spin(z, 2)[0])
         out.append({"z": z, "pos": rng.standard_normal((len(z), 3)) * 1.5,
-                    "energy": np.float64(rng.uniform(-500, -100)),
                     "wannier": [{"centers": rng.standard_normal((k, 3)),
                                  "radii": rng.uniform(0.75, 0.95, k)} for _ in range(2)]})
     return out

@@ -26,11 +26,6 @@ wannier:
   nms_radius: 0.3          # A; selected centers closer than this are merged (true spacing
                            #   >= 0.48 A); candidates this close to a matched one are positives
 
-loss:
-  energy_loss: l1           # l1 = |dE|/sigma_E (normalized, EGNN's QM9 recipe) | mse = dE^2 in eV^2
-  lambda_energy: 1.0
-  lambda_wannier: 1.0
-
 train:
   lr: 1.0e-3
   grad_clip: 1.0            # clip global grad norm (stability safety net)

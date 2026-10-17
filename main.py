@@ -1,4 +1,4 @@
-"""Predict energy + Wannier centers from SIESTA `.fdf` geometry (no `.wout` needed — the model
+"""Predict Wannier centers + radii from SIESTA `.fdf` geometry (no `.wout` needed — the model
 infers Wannier positions from geometry alone; CLAUDE.md §1).
 
 Single file  -> human-readable block on stdout.
@@ -32,7 +32,7 @@ def load_model(cfg, params_path, z0, pos0):
 
 
 def record_for(name, out, spins, z, nms=0.0):
-    """One JSON record: {input, energy, wannier:{spin:[{position, radius}, ...]}}.
+    """One JSON record: {input, wannier:{spin:[{position, radius}, ...]}}.
     Each spin's centers are its k top-scoring candidates, k = valence electrons / 2
     (data/electrons.py)."""
     k = centers_per_spin(z, len(spins))
@@ -41,7 +41,7 @@ def record_for(name, out, spins, z, nms=0.0):
     wannier = {spin: [{"position": [round(float(v), 6) for v in centers[s, j]],
                        "radius": round(float(radii[s, j]), 6)} for j in range(k[s])]
                for s, spin in enumerate(spins)}
-    return {"input": name, "energy": round(float(out["energy"]), 6), "wannier": wannier}
+    return {"input": name, "wannier": wannier}
 
 
 def run_directory(input_dir, cfg, out_path, params_path):
@@ -89,7 +89,6 @@ def run_single(fdf_path, cfg, params_path):
     model, params = load_model(cfg, params_path, z, pos)
     out = model.apply(params, z, pos)
 
-    print(f"energy = {float(out['energy']):.4f} eV")
     spins = cfg["wannier"]["spins"]
     k = centers_per_spin(z, len(spins))
     sel = select_centers(out["wannier"], k, nms_radius(cfg))
@@ -103,7 +102,7 @@ def run_single(fdf_path, cfg, params_path):
 def build_argparser():
     ap = argparse.ArgumentParser(
         prog="main.py",
-        description="Predict total energy + Wannier centers from SIESTA .fdf geometry. "
+        description="Predict Wannier centers + radii (per spin) from SIESTA .fdf geometry. "
                     "Wannier positions are inferred from geometry alone (no .wout input).",
         epilog="examples:\n"
                "  uv run python main.py molecule.fdf --params params.msgpack\n"

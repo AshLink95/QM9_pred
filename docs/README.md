@@ -9,7 +9,7 @@ code alone. Commands for running everything are in the top-level [README](../REA
 
 **Background (start here if the science or ML is new to you):**
 1. **[physics_primer.md](physics_primer.md)** — atoms, valence electrons, DFT/SIESTA, total
-   energy, Wannier centers and radii, spin, the files on disk, why symmetry matters.
+   Wannier centers and radii, spin, the files on disk, why symmetry matters.
 2. **[ml_primer.md](ml_primer.md)** — loss, gradient descent, batches/epochs, train/val/test,
    graph neural networks, invariance/equivariance, predicting a set (matching), loss balance.
 3. **[developer_guide.md](developer_guide.md)** — repo map, setup, the development loop, rules you
@@ -19,11 +19,11 @@ code alone. Commands for running everything are in the top-level [README](../REA
 **Implementation, one doc per code directory:**
 5. **[jax_flax_primer.md](jax_flax_primer.md)** — the JAX/Flax syntax used everywhere
    (`init`/`apply`, `@nn.compact`, `jit`, `vmap`, `value_and_grad`, sharding, schedules).
-6. **[data.md](data.md)** — parsing `.fdf`/`.out`/`.wout`, matching files by molecule id, the
+6. **[data.md](data.md)** — parsing `.fdf`/`.wout`, matching files by molecule id, the
    center count per spin, the split.
 7. **[model.md](model.md)** — the EGNN layer line by line, the equivariance proof, the heads.
    *The centerpiece.*
-8. **[losses.md](losses.md)** — energy MSE and the Wannier loss (count from composition,
+8. **[losses.md](losses.md)** — the Wannier loss (count from composition,
    Hungarian-matched positions and radii per spin, fixed-width cloud guide), and why the first
    Wannier loss failed.
 9. **[training.md](training.md)** — the training loop step by step: precomputed batches, the
@@ -40,17 +40,17 @@ code alone. Commands for running everything are in the top-level [README](../REA
 ```
  files on disk                         data/ (deterministic, no learning)
    .fdf ─ parse_siesta ─┐
-   .out ─ parse_siesta ─┼─► {Z, pos, energy, wannier targets} ─► graph (fully connected)
+                        ├─► {Z, pos, wannier targets} ─► graph (fully connected)
   .wout ─ parse_wout ───┘                    │
                                              ▼                 model/ (all the learning)
                         ElementEmbedding → h │ pos → x
                                   EGNNBackbone (h invariant, x equivariant)
                                              │
-                              ┌──────────────┴──────────────┐
-                        EnergyHead (Σ scalars)        WannierHead (per-atom candidates → set)
+                                             │
+                          WannierHead (per-atom candidates → set; NMS picks k)
                                              │
                                              ▼                 losses/
-              λ_E·energy MSE + λ_W·(matched positions + radii + fixed-width guide), per spin
+           matched positions + radii + selection + fixed-width guide, per spin (Wannier only)
                                              │
                                              ▼                 training/
                               optax loop → params → checkpoint
@@ -69,7 +69,7 @@ interface — neither side reaches across.
 |---|---|---|---|
 | §3 | graph / pipeline boundary | `data/graph.py`, `data/dataset.py` | [data](data.md) |
 | §4 | EGNN backbone | `model/egnn.py` | [model](model.md) |
-| §5 | energy + Wannier heads | `model/heads.py` | [model](model.md) |
+| §5 | Wannier head | `model/heads.py` | [model](model.md) |
 | §6 | Wannier count + loss | `data/electrons.py`, `losses/wannier_match.py`, `losses/wannier_cloud.py` | [losses](losses.md) |
 | §8 | symmetry verification | `symmetry/transforms.py`, `tests/test_equivariance.py` | [symmetry](symmetry.md) |
 | §9 | data parsing | `data/parse_siesta.py`, `data/parse_wout.py`, `data/units.py` | [data](data.md) |
@@ -79,10 +79,8 @@ interface — neither side reaches across.
 
 - **`configs/`** — YAML hyperparameters; code reads these, no magic numbers in code (CLAUDE.md
   §11). `default.yaml` (CPU, batch 32), `gpu.yaml` (same model, batch 256),
-  `energy_only.yaml` (`lambda_wannier: 0`, the energy-only ablation), `sweep.yaml` (the planned
-  two-stage sweep). Keys: model size
-  (`model.*`), Wannier settings (`wannier.max_centers`, `spins`, `guide_sigma`, `radius_weight`,
-  `guide_weight`), loss weights (`loss.*`), training (`train.*`).
+  `sweep.yaml` (the planned two-stage sweep). Keys: model size (`model.*`), Wannier settings and
+  loss weights (`wannier.*`), training (`train.*`).
 - **`scripts/`** — thin CLI wiring only: `build_dataset`, `train`, `evaluate` (accuracy report;
   logic in `training/report.py`), `sweep` (work / status / requeue / promote; logic in
   `training/sweep.py`), run with `python -m scripts.<name>`; plus the launchers to call from your

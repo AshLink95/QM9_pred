@@ -55,7 +55,6 @@ def test_translation(fixture):
     t = jnp.array([1.3, -2.1, 0.7])
     base = apply(params, pos)
     out = apply(params, jnp.array(T.translate(np.asarray(pos), np.asarray(t))))
-    np.testing.assert_allclose(out["energy"], base["energy"], atol=1e-8)
     np.testing.assert_allclose(out["wannier"]["centers"],
                                base["wannier"]["centers"] + t, atol=1e-8)
 
@@ -65,7 +64,6 @@ def test_rotation(fixture):
     R = T.random_rotation(seed=1)
     base = apply(params, pos)
     out = apply(params, jnp.array(T.rotate(np.asarray(pos), R)))
-    np.testing.assert_allclose(out["energy"], base["energy"], atol=1e-8)
     rotated = base["wannier"]["centers"] @ jnp.array(R).T
     np.testing.assert_allclose(out["wannier"]["centers"], rotated, atol=1e-8)
     # invariant per-slot quantities unchanged
@@ -79,7 +77,6 @@ def test_permutation(fixture):
     base = apply(params, pos)
     out = model.apply(params, jnp.array(np.asarray(z)[perm]),
                       jnp.array(np.asarray(pos)[perm]))
-    np.testing.assert_allclose(out["energy"], base["energy"], atol=1e-8)
     # candidates belong to atoms: permuting the atoms permutes their candidates, nothing else
     n = len(z)
     for key in ("centers", "radii", "logits"):
@@ -92,7 +89,6 @@ def test_mirror(fixture):
     base = apply(params, pos)
     out = apply(params, jnp.array(T.mirror(np.asarray(pos), axis=1)))
     Mx = jnp.eye(3).at[1, 1].set(-1.0)
-    np.testing.assert_allclose(out["energy"], base["energy"], atol=1e-8)
     # no chiral features -> centers reflect exactly (§8). Singles map one to one; the two members
     # of a ± pair swap (their offset u × v is a pseudovector), so each pair reflects AS A SET.
     n = len(z)
@@ -154,9 +150,10 @@ def test_egnn_options_stay_equivariant(opts):
     R = np.asarray(T.random_rotation(seed=6))
     t = np.array([0.4, -1.0, 2.0])
     out = model.apply(params, z, jnp.array(np.asarray(pos) @ R.T + t))
-    np.testing.assert_allclose(out["energy"], base["energy"], atol=1e-8)
     np.testing.assert_allclose(out["wannier"]["centers"],
                                np.asarray(base["wannier"]["centers"]) @ R.T + t, atol=1e-8)
     perm = T.permutation(6, seed=7)
     outp = model.apply(params, z[perm], pos[perm])
-    np.testing.assert_allclose(outp["energy"], base["energy"], atol=1e-8)
+    np.testing.assert_allclose(np.sort(np.asarray(outp["wannier"]["centers"]), axis=None),
+                               np.sort(np.asarray(base["wannier"]["centers"]), axis=None),
+                               atol=1e-8)

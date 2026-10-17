@@ -192,7 +192,8 @@ def maybe_promote(q, spec, force=False):
     states = {r["name"]: q.state_of(r["name"]) for r in spec["runs"]}
     if not force and any(s not in ("finished", "failed") for s in states.values()):
         return False
-    # runs marked `promote: false` (diagnostics, e.g. energy only) are never promoted
+    # runs marked `promote: false` (diagnostics whose objective isn't comparable) are never
+    # promoted
     eligible = {r["name"] for r in spec["runs"] if r.get("promote", True)}
     finished = [n for n, s in states.items() if s == "finished" and n in eligible]
     if not finished:
@@ -262,8 +263,9 @@ def run_one(q, name, spec, examples, meta, stop):
                                          examples=examples, dataset_path=spec["dataset"])
         w = summary["wannier"]["all"]
         (run_dir / "result.json").write_text(json.dumps({
-            "status": status, "test_energy_mae": summary["energy"]["mae"],
-            "test_center_mae": w["center_mae"], "test_radius_mae": w["radius_mae"],
+            "status": status, "test_center_mae": w["center_mae"],
+            "test_center_median": w["center_median"], "test_center_rmse": w["center_rmse"],
+            "test_frac_over_1A": w["frac_over_1.0"], "test_radius_mae": w["radius_mae"],
             "test_count_accuracy": w["count_accuracy"]}, indent=2))
         if not q.move(name, "running", "finished"):
             print(f"[sweep] WARNING: '{name}' was reclaimed by another job while running",
@@ -327,22 +329,22 @@ def status(spec_path):
             "run": n, "state": q.state_of(n) or "-",
             "epoch": f"{prog.get('epoch', '-')}/{prog.get('epochs', '-')}",
             "val_obj": best.get("objective", float("inf")),
-            "val_E": best.get("energy_mae"), "val_center": (sum(centers.values()) / len(centers)
-                                                            if centers else None),
-            "val_radius": best.get("radius_mae"), "test_E": res.get("test_energy_mae"),
-            "test_center": res.get("test_center_mae"), "job": owner.get("slurm_job_id") or "-"})
+            "val_center": (sum(centers.values()) / len(centers) if centers else None),
+            "val_radius": best.get("radius_mae"), "test_center": res.get("test_center_mae"),
+            "test_median": res.get("test_center_median"), "test_rad": res.get("test_radius_mae"),
+            "job": owner.get("slurm_job_id") or "-"})
     stage1 = [r for r in rows if r["run"] != FINAL]
     winner = min((r for r in stage1 if r["state"] == "finished"), key=lambda r: r["val_obj"],
                  default=None)
     f = lambda x: "-" if x is None or x == float("inf") else f"{x:.4f}"
-    head = (f"{'run':<16}{'state':<10}{'epoch':>10}{'val obj':>10}{'val E':>9}{'val ctr':>9}"
-            f"{'val rad':>9}{'test E':>9}{'test ctr':>9}  job")
+    head = (f"{'run':<16}{'state':<10}{'epoch':>10}{'val obj':>10}{'val ctr':>9}{'val rad':>9}"
+            f"{'test ctr':>9}{'test med':>9}{'test rad':>9}  job")
     lines = [f"sweep '{spec['name']}' ({q.root})", head, "-" * len(head)]
     for r in sorted(stage1, key=lambda r: r["val_obj"]) + [r for r in rows if r["run"] == FINAL]:
         mark = " *" if winner and r["run"] == winner["run"] else ""
         lines.append(f"{r['run'] + mark:<16}{r['state']:<10}{r['epoch']:>10}{f(r['val_obj']):>10}"
-                     f"{f(r['val_E']):>9}{f(r['val_center']):>9}{f(r['val_radius']):>9}"
-                     f"{f(r['test_E']):>9}{f(r['test_center']):>9}  {r['job']}")
+                     f"{f(r['val_center']):>9}{f(r['val_radius']):>9}{f(r['test_center']):>9}"
+                     f"{f(r['test_median']):>9}{f(r['test_rad']):>9}  {r['job']}")
     lines.append("* = best finished stage-1 run (promoted to 'final'). E in eV, ctr/rad in Å.")
     return "\n".join(lines)
 

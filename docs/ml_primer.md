@@ -12,8 +12,7 @@ Related: [physics_primer](physics_primer.md) · [developer_guide](developer_guid
 ## 1. What "learning" means here
 
 We have ~118,000 molecules where we already know the right answers (from SIESTA, see
-[physics_primer](physics_primer.md)): an energy, plus the Wannier centers and radii for each
-spin. We want a function that, given **only** a new molecule's atoms and positions, produces
+[physics_primer](physics_primer.md)): the Wannier centers and radii for each spin. We want a function that, given **only** a new molecule's atoms and positions, produces
 those answers. This is **supervised learning**, and since the answers are numbers it's
 **regression**.
 
@@ -27,13 +26,13 @@ To adjust parameters you need a single number measuring how wrong the network cu
 **loss**. Lower is better.
 
 - **MSE (mean squared error):** the average of (prediction − truth)². Squaring makes all errors
-  positive and punishes big errors more. Used for training the energy (`E` in the log, in eV²)
-  and the Wannier positions (`pos`, in Å²).
+  positive and punishes big errors more. Used here for the normalized radius term.
 - **MAE (mean absolute error):** the average of |prediction − truth|. Same units as the quantity
-  itself, so it's easier to read. Used for *reporting* (e.g. "energy MAE 0.168 eV").
-- With several targets the total loss is a **weighted sum**, e.g.
-  `λ_E · energy_loss + λ_W · wannier_loss`. The weights (λ, "lambda") matter: the terms have
-  different units, and if one term is huge it dominates training (§10).
+  itself, so it's easier to read. Used for *reporting* (e.g. "center MAE 0.127 Å") and, as the
+  plain distance, for training the Wannier positions (`pos` in the log, in Å).
+- When the loss has several parts, it is a **weighted sum**, here
+  `pos + radius_weight·radius + select_weight·select + guide_weight·guide`. All parts describe the
+  same predicted set of centers; the weights balance its aspects (§10).
 
 ## 3. How parameters get adjusted: gradient descent
 
@@ -73,8 +72,8 @@ The data is split once, with a fixed random seed, into three non-overlapping gro
 - **Overfitting:** the network memorizes the training molecules and does worse on new ones.
   Signature: training error keeps falling while validation error rises.
 - **Underfitting:** the network can't even fit the training data well. Signature: training and
-  validation errors are about equal and both too high. (The first energy model here was
-  underfitting: about 0.20 eV on train, 0.17 eV on val.)
+  validation errors are about equal and both too high. (The first model here was underfitting:
+  its training and validation errors were nearly equal.)
 - Report the **test** number. Scoring on training molecules always looks too good.
 
 ## 6. Building blocks of the network
@@ -103,15 +102,15 @@ A GNN works by **message passing**, repeated over several **layers**:
 3. Each atom **updates** its features from its old features plus that sum.
 
 After a few layers each atom's features encode its whole chemical environment. A **readout**
-then turns per-atom features into outputs: the energy is the **sum** of one number per atom.
-Summing makes the energy grow with molecule size, as real energies do.
+then turns per-atom features into outputs: here each atom proposes a few candidate Wannier
+centers built from its features and its neighbors' positions ([model](model.md) §5).
 
 > **In the code:** `model/egnn.py` (message passing), `model/heads.py` (readouts).
 
 ## 8. Symmetry: invariance and equivariance
 
 From [physics_primer](physics_primer.md) §8: rotating or moving a molecule must not change the
-energy (**invariance**) and must move the Wannier centers the same way (**equivariance**).
+radii (**invariance**) and must move the Wannier centers the same way (**equivariance**).
 
 Two ways to get that:
 - **Data augmentation:** train on many randomly rotated copies and hope the network learns the
@@ -128,8 +127,7 @@ already passes the rotation, translation, permutation, and mirror tests
 
 ## 9. Predicting a *set*: the Wannier centers
 
-The energy is one number. The Wannier centers of a spin are a **set** of points with **no
-natural order**. Nothing makes one center "the first". That breaks the obvious loss:
+The Wannier centers of a spin are a **set** of points with **no natural order**. Nothing makes one center "the first". That breaks the obvious loss:
 
 > Pair predicted center #1 with true center #1, #2 with #2, and so on: a correct prediction
 > listed in a different order would be scored as badly wrong.
@@ -172,29 +170,34 @@ the turn swaps two hydrogens, their candidates swap too. Nothing random is added
 molecule always gives the same set. (For centers above and below the plane of a flat molecule,
 candidates come in mirror pairs; see [model](model.md) §5.)
 
-## 10. Balancing several targets
+## 10. One target per model, and balancing the loss terms
 
-The total loss adds terms in different units (eV² for energy, Å² for positions). If one term is
-1,000× bigger, nearly all of the gradient serves it and the other target barely trains. That
-happened twice here: raw energies once made the energy loss ~10¹² and training diverged; later
-the old Wannier term (~44) swamped the energy term (~0.06). Remedies, in the order this code uses
-them:
-- **Normalize targets** so terms are on similar scales (energy reference, radius divided by its
-  spread, §11).
-- **Weights** in the config (`loss.lambda_*`, `wannier.*_weight`), checked by reading each term
-  in the epoch log line.
-- (Not implemented yet) learning the weights automatically, e.g. uncertainty weighting
+**Why this model predicts only Wannier targets.** It used to predict the total energy too, with
+one network and one loss `λ_E·energy + λ_W·Wannier`. The two kept trading off: weighting Wannier
+down gave a better energy (v2: 0.058 eV) and worse centers; weighting them equally gave better
+centers and a worse energy (v3: 0.075 eV). The shared weights were pulled toward two unrelated
+goals, and the loss settled on a compromise. Machine learning calls this **negative transfer**:
+tasks that compete for one network do worse together than apart, more so in small networks
+(Standley et al. 2020, [refs](refs.md)). Wannier ML codes keep the Wannier model separate from
+the energy model for the same reason. So: one objective per model; an energy model, if needed,
+is a separate network.
+
+**Balancing the terms that remain.** The Wannier loss still has parts in different units (Å for
+positions, a normalized radius, a classification term, the guide). If one is 1,000× bigger,
+nearly all of the gradient serves it. Remedies used here:
+- **Normalize** so terms are on similar scales (radius divided by its spread, §11).
+- **Weights** in the config (`wannier.*_weight`), checked by reading each term in the epoch log
+  line.
+- (Not implemented) learning the weights automatically, e.g. uncertainty weighting
   (Kendall et al., 2018).
 
 ## 11. Baselines and normalization
 
 - A **baseline** is the error of a trivial predictor. Always compare against one:
-  - energy: "sum of one number per element" (composition baseline) → ~0.9 eV;
   - radius: "always predict the average radius" → 0.052 Å.
   A model that doesn't beat its baseline has learned nothing useful.
 - **Normalization:** shift and scale targets so the network works with numbers of order 1. Here
-  the energy is predicted as `composition baseline + learned correction`, and the radius starts
-  at the dataset average with errors divided by the dataset spread.
+  the radius starts at the dataset average, with errors divided by the dataset spread.
 
 ## 12. Practical training issues
 
@@ -230,8 +233,8 @@ Three techniques this project uses because they are standard where accuracy matt
 | p95 | 95% of errors are smaller than this; shows the bad tail |
 | count accuracy | share of (molecule, spin) where predicted count = true count (100% by construction now; it checks the valence rule) |
 
-To judge a number: compare it with the baseline, with the physical scale (chemical accuracy
-0.043 eV; bonds are 1.1–1.5 Å long), and with the noise floor (Wannier labels: ~0.013 Å).
+To judge a number: compare it with the baseline, with the physical scale (bonds are 1.1–1.5 Å
+long), and with the noise floor (Wannier labels: ~0.013 Å).
 
 ## 14. Learning-rate schedules, early stopping, and how many epochs
 

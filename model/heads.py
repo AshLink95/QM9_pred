@@ -1,6 +1,5 @@
-"""Output heads (CLAUDE.md §5).
+"""Wannier output head (CLAUDE.md §5).
 
-EnergyHead    -- invariant scalar, sum of per-atom readouts (size-extensive).
 WannierHead   -- equivariant point SET per spin channel, built from per-atom candidates. Each
                  candidate has a center (equivariant), a radius (invariant, >0) and a selection
                  logit (invariant). How many centers are real is NOT predicted: it's Σ valence/2
@@ -43,19 +42,6 @@ import jax.numpy as jnp
 import numpy as np
 
 from .egnn import _mlp, gaussian_rbf
-
-
-class EnergyHead(nn.Module):
-    hidden_dim: int
-
-    @nn.compact
-    def __call__(self, h: jnp.ndarray) -> jnp.ndarray:
-        """h[N,H] -> scalar energy = sum_i MLP(h_i) (invariant, size-extensive)."""
-        per_atom = nn.Sequential([
-            nn.Dense(self.hidden_dim, name="e0"), nn.silu,
-            nn.Dense(1, name="e1"),
-        ])(h)                                       # [N,1]
-        return jnp.sum(per_atom)                     # scalar
 
 
 class WannierHead(nn.Module):

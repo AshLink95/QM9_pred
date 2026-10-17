@@ -1,10 +1,11 @@
-# QM9 → Wannier + Energy Predictor
+# QM9 → Wannier Center Predictor
 
 A neural network that takes a molecule's **atoms and their positions** and predicts what an
-expensive quantum-chemistry calculation (SIESTA + Wannier90) would produce:
-- the molecule's **total energy** (eV);
-- its **Wannier centers**, the points where its electron pairs sit (one per bond / lone pair),
-  each with a **radius**, separately for **spin up** and **spin down**.
+expensive quantum-chemistry calculation (SIESTA + Wannier90) would produce: its **Wannier
+centers**, the points where its electrons sit (one per bond / lone pair and spin), each with a
+**radius**, separately for **spin up** and **spin down**. The model optimizes these alone; the
+total energy was dropped because training both in one network traded one off against the other
+(CLAUDE.md §1).
 
 A calculation that takes minutes per molecule becomes a millisecond prediction. The network is an
 **E(3)-equivariant graph neural network (EGNN)**: rotating, moving, mirroring, or relabeling a
@@ -22,7 +23,7 @@ guide → one doc per code directory) plus a glossary. Design decisions and thei
 - Linux or macOS, Python 3.14 (installed automatically by `uv`).
 - [`uv`](https://docs.astral.sh/uv/) for environments: `curl -LsSf https://astral.sh/uv/install.sh | sh`.
 - For training: an NVIDIA GPU is recommended (one is enough). CPU works but is slower.
-- The data: SIESTA/Wannier90 output folders (`.fdf`, `.out`, `.wout` per molecule).
+- The data: SIESTA/Wannier90 output folders (`.fdf` and one `.wout` per spin, per molecule).
 
 ## 2. Install
 ```bash
@@ -50,8 +51,10 @@ instead of `uv run`** (see §4). Every script has `--help`.
 ```bash
 uv run python -m scripts.build_dataset /path/to/parent --out dataset.pkl
 ```
-- Give one or more folders. Each is searched **recursively**. The `.fdf`, `.out`, and `.wout`
-  of a molecule may sit in different subfolders (e.g. `done/`, `out_files/`, `wout_files/`).
+- Give one or more folders. Each is searched **recursively**. The `.fdf` and `.wout` files of a
+  molecule may sit in different subfolders (e.g. `done/`, `wout_files/`). SIESTA's `.out` is not
+  needed. An existing `dataset.pkl` built with energies still works (the energy is ignored);
+  keep using it so the test molecules stay the same.
   They're matched by **molecule id**, the filename up to the first `.` (e.g. `C2F3N3O_133481`).
 - Each molecule needs `<id>.fdf`, `<id>…out`, and one `.wout` per spin whose name contains `up`
   or `down`.
@@ -71,7 +74,7 @@ uv run python -m scripts.train --config configs/gpu.yaml --dataset dataset.pkl -
 - Uses every GPU the job can see (data parallel); the log says `data-parallel over N device(s)`.
 - Learning rate: 5-epoch warmup, then cosine decay to 1% (`train.lr_schedule`).
 - Every `ckpt_every` epochs it validates and prints one line: training loss terms, then
-  `val obj` (lower = better), validation energy error (eV), per-spin center error and radius error
+  `val obj` (lower = better), per-spin center error and radius error
   (Å), and `* new best` when it improves.
 - Files next to `--out`: `params.msgpack` (**best** epoch: what evaluate/predict use),
   `params.last.msgpack` (resumable state), `params.best.json` (best epoch's metrics),
@@ -102,14 +105,12 @@ uv run python -m scripts.evaluate --config configs/gpu.yaml --params params.msgp
 - Default: scores the **test split**, ~11.8k molecules training never saw. `--subset
   val|train|all` scores other parts; train vs test shows memorization.
 - Writes `accuracy_report/` (or `--out-dir`):
-  - `summary.txt`: energy error (MAE, RMSE, median, p95, max, bias) next to the composition-only
-    baseline; per-spin Wannier center error (Å), radius error, count accuracy; a rotation
-    symmetry check. Also printed.
-  - `molecules.csv`: per molecule, SIESTA vs predicted energy and per-spin errors.
+  - `summary.txt`: per-spin Wannier center error (MAE, RMSE, median, p95, share within 0.1 Å,
+    share over 1 Å), radius error, count accuracy; a rotation symmetry check. Also printed.
+  - `molecules.csv`: per molecule, the per-spin center and radius errors.
   - `centers.csv`: per center, SIESTA's position and radius next to the matched prediction.
-  - `plots/`: one image per plot, spin up and down pooled — `energy_error_vs_energy.png`,
-    `energy_error_hist.png`, `center_error_hist.png`, `radius_parity.png`,
-    `molecule_center_error_hist.png`.
+  - `plots/`: one image per plot, spin up and down pooled — `center_error_hist.png`,
+    `radius_parity.png`, `molecule_center_error_hist.png`.
 - How to read these numbers (what is good or bad): [docs/ml_primer.md](docs/ml_primer.md) §13.
 
 ### Step 4 — Predict new molecules
@@ -120,7 +121,7 @@ uv run python main.py folder_of_fdfs/ --config configs/gpu.yaml --params params.
 Only `.fdf` geometry is needed. One file prints a readable block; a folder (only its `.fdf`
 files, not recursive) writes one JSON array:
 ```json
-[{"input": "mol1.fdf", "energy": -2421.40,
+[{"input": "mol1.fdf",
   "wannier": {"up":   [{"position": [0.01, 0.02, 0.70], "radius": 0.85}, ...],
               "down": [{"position": [0.01, 0.02, 0.70], "radius": 0.85}, ...]}}]
 ```
@@ -176,8 +177,6 @@ Failed run: read `runs/<sweep>/<run>/error.txt`, then
 | `wannier.spins` | `[up, down]` |
 | `wannier.guide_sigma` | fixed width (Å) of the smooth guide term in the Wannier loss |
 | `wannier.radius_weight`, `wannier.guide_weight` | weights of the radius and guide terms |
-| `loss.energy_loss` | `l1` (mean absolute ΔE divided by σ_E, default) or `mse` (ΔE² in eV²) |
-| `loss.lambda_energy`, `loss.lambda_wannier` | weights of the energy and Wannier losses (`0` turns one off) |
 | `train.lr`, `train.grad_clip` | peak learning rate, gradient-clipping limit |
 | `train.ema_decay` | moving average of the weights used for validation and checkpoints (0.99; 0 = off) |
 | `train.lr_schedule`, `train.warmup_epochs`, `train.lr_end_frac` | `cosine` (warmup, then decay to `lr·lr_end_frac`) or `constant` |
@@ -186,8 +185,7 @@ Failed run: read `runs/<sweep>/<run>/error.txt`, then
 | `train.seed` | initial weights + batch order |
 | `train.split_seed`, `train.val_frac`, `train.test_frac` | the train/val/test split (keep `split_seed` fixed) |
 
-Files: `default.yaml` (CPU), `gpu.yaml` (GPU, larger batches), `energy_only.yaml` (energy alone,
-for a quick sanity check), `sweep.yaml` (the planned sweep: base config, variants, stage
+Files: `default.yaml` (CPU), `gpu.yaml` (GPU, larger batches), `sweep.yaml` (the planned sweep: base config, variants, stage
 settings; see [docs/sweeps.md](docs/sweeps.md)).
 
 ## 6. Tests and notebooks
@@ -219,7 +217,7 @@ More: [docs/developer_guide.md](docs/developer_guide.md) §7.
 ## 8. Project layout
 ```
 data/       parsing, file matching, the split, center counts          (no learning)
-model/      the EGNN and its energy / Wannier outputs                  (all the learning)
+model/      the EGNN and its Wannier output                            (all the learning)
 losses/     the Wannier loss (matched, per spin) and the cloud overlap
 training/   training loop, metrics, accuracy report
 symmetry/   transforms used by the symmetry tests
@@ -243,8 +241,11 @@ docs/       documentation, from zero background
   energy MAE **0.075 eV**, center MAE **0.127 Å** (median **0.056 Å**), radius MAE **0.011 Å**.
   The center mean is dominated by duplicates: 2.6% of centers are > 1 Å off, mostly next to a
   duplicate selection.
-- **Current code** (sweep `wannier_v4`): NMS selection with NMS-consistent targets, L1 losses
-  (normalized energy, distance for centers), weight EMA; EGNN QM9 options as sweep variants
-  (CLAUDE.md §5–§6, [docs/refs.md](docs/refs.md)). v3 checkpoints still load: re-evaluating one
-  applies NMS (`nms_radius` defaults to 0.3 Å for older configs). **Awaiting the v4 sweep.**
+- **Current code** (sweep `wannier_v4`): **Wannier only** — the energy target, head and loss
+  are removed (CLAUDE.md §1: energy and Wannier traded off in one network). NMS selection with
+  NMS-consistent targets, L1 distance loss, weight EMA; EGNN QM9 options as sweep variants
+  (CLAUDE.md §5–§6, [docs/refs.md](docs/refs.md)). v1–v3 numbers above include energy because
+  those models predicted it. v3 checkpoints still load (their energy weights are ignored), and
+  re-evaluating one applies NMS (`nms_radius` defaults to 0.3 Å for older configs). **Awaiting
+  the v4 sweep.**
 - Not implemented: molecule ids saved in `dataset.pkl`; multi-node training.

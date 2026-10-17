@@ -55,32 +55,19 @@ Related: [ml_primer](ml_primer.md) (the machine-learning side) · [developer_gui
 | Quantity | Unit used here | Notes |
 |---|---|---|
 | length | **Å** (ångström, 10⁻¹⁰ m) | a C–H bond is ≈ 1.09 Å |
-| energy | **eV** (electron-volt) | |
-| length, atomic unit | Bohr = 0.529 Å | appears only in parts of SIESTA's `.out` we don't use |
-| energy, atomic unit | Ry (Rydberg) = 13.606 eV | |
+| length, atomic unit | Bohr = 0.529 Å | appears in `.fdf` files written in Bohr; converted on parsing |
 
-> **In the code:** `data/units.py` holds the conversions. Everything inside the pipeline is in Å
-> and eV.
+> **In the code:** `data/units.py` holds the conversions. Everything inside the pipeline is in Å.
 
-## 4. The first target: total energy
+## 4. What is not predicted: the total energy
 
-- SIESTA reports a **total energy** for each molecule (the line `siesta: Total = …` in the
-  `.out` file). It's the energy of the simulated valence electrons and pseudo-ions together.
-- The numbers are large and negative (roughly −500 to −3,500 eV here) because they include how
-  tightly every valence electron is bound. Only **differences** between energies matter
-  physically (reaction energies, which conformation is more stable).
-- Most of a molecule's total energy is explained by **which atoms it contains**: roughly, each
-  carbon contributes about the same amount wherever it is. A least-squares fit of "energy ≈ sum
-  of one number per element" (the **composition baseline**) already gets within ~0.9 eV. The
-  network's real job is the remaining part, which depends on geometry and bonding.
-- **Chemical accuracy** is 1 kcal/mol ≈ **0.043 eV**: the error level chemists consider good
-  enough for predictions. Use it as the yardstick for energy error.
+SIESTA also reports a **total energy** for each molecule (the last `siesta: Total = …` line in
+its `.out` log). An earlier version of this model predicted it alongside the Wannier centers. It
+was removed: one network trained on both kept trading one target off against the other, so this
+model predicts **only the Wannier targets** (CLAUDE.md §1; [ml_primer](ml_primer.md) §10). The
+`.out` files are therefore not read.
 
-> **In the code:** `data/parse_siesta.py:parse_energy` takes the **last** `siesta: Total` line,
-> since earlier lines are unconverged SCF steps. The model's per-element offset (`atom_ref`) is
-> initialized from that composition fit (`training/train.py:_fit_atom_ref`).
-
-## 5. The second target: Wannier centers
+## 5. The target: Wannier centers
 
 ### Orbitals
 Quantum mechanics describes electrons with **orbitals**: functions telling where an electron
@@ -146,14 +133,14 @@ either. In our data, the spin-up and spin-down sets, which should be identical, 
 | File | Written by | What we take from it |
 |---|---|---|
 | `<id>.fdf` | the SIESTA **input** | element list and atom coordinates (the model's input) |
-| `<id>.out` | the SIESTA log | the last `siesta: Total = …` (converged energy, eV) |
+| `<id>.out` | the SIESTA log | nothing (not read) |
 | `<id>.manifold.valence.up.wout` / `.down.wout` | Wannier90 log, one per spin | the `Final State` block: each center's x, y, z and spread |
 
 The `.out` also lists "trial projector" centers (starting guesses for Wannier90, in Bohr). They
 are **never used**: the model must predict the converged centers from geometry alone.
 
-`<id>` is the molecule id, e.g. `C2F3N3O_133481`. The three file types can live in different
-folders; they're matched by this id ([data](data.md) §5).
+`<id>` is the molecule id, e.g. `C2F3N3O_133481`. The `.fdf` and `.wout` files can live in
+different folders; they're matched by this id ([data](data.md) §5).
 
 A `.fdf` excerpt:
 ```
@@ -179,10 +166,10 @@ The four numbers are the center's x, y, z (Å) and its spread (Å²).
 ## 8. Symmetry: why the model is built the way it is
 
 Physics doesn't care where you put a molecule or which way it faces:
-- **Move or rotate** the molecule → the energy stays the same (it is **invariant**), and the
-  Wannier centers move and rotate *with* the molecule (they are **equivariant**).
+- **Move or rotate** the molecule → the Wannier radii stay the same (they are **invariant**), and
+  the Wannier centers move and rotate *with* the molecule (they are **equivariant**).
 - **Relabel the atoms** (call atom 3 "atom 1") → nothing physical changes.
-- **Mirror** the molecule → the energy is the same and the centers mirror. (A molecule that
+- **Mirror** the molecule → the radii are the same and the centers mirror. (A molecule that
   differs from its mirror image is **chiral**. Only properties that tell mirror images apart may
   legitimately differ; none of ours do.)
 

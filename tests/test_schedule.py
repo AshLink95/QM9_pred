@@ -13,7 +13,6 @@ CFG = {
     "model": {"hidden_dim": 16, "n_layers": 2, "n_elements": 10,
               "rbf": {"enabled": True, "n_basis": 8, "cutoff": 10.0}},
     "wannier": WANNIER_CFG,
-    "loss": {"lambda_energy": 1.0, "lambda_wannier": 1.0},
     "train": {"lr": 5e-3, "batch_size": 4, "epochs": 4, "ckpt_every": 1, "seed": 0,
               "split_seed": 0, "val_frac": 0.25, "test_frac": 0.25, "lr_schedule": "constant"},
 }
@@ -78,9 +77,8 @@ def test_ema_weights_and_resume(tmp_path):
 
 
 def test_new_loss_settings_train(tmp_path):
-    """The v4 recipe (L1 energy and positions, NMS targets, EMA) trains end to end."""
+    """The v4 recipe (L1 positions, NMS targets, EMA) trains end to end."""
     c = _cfg(epochs=3, ema_decay=0.99)
-    c["loss"]["energy_loss"] = "l1"
     c["wannier"] = {**c["wannier"], "position_loss": "l1", "nms_radius": 0.3}
     params, status = train_with_status(c, molecules(12), ckpt_path=tmp_path / "p.msgpack")
     assert status == "finished"
@@ -99,11 +97,28 @@ def test_val_objective_independent_of_loss_forms():
     buckets = stack_buckets(ex, 2, 10)
     objs = set()
     with ThreadPoolExecutor(2) as pool:
-        for e_form in ("l1", "mse"):
-            for p_form in ("l1", "mse"):
-                wkw = {"r_std": 0.07, "radius_weight": 1.0, "nms_radius": 0.3,
-                       "position_loss": p_form}
-                v = _validate(fwd, params, buckets, ex, lambda x: x, ["up", "down"], 1.0, 1.0,
-                              wkw, {"form": e_form, "e_std": 2.0}, 4, pool)
-                objs.add(round(v["objective"], 10))
+        for p_form in ("l1", "mse"):
+            wkw = {"r_std": 0.07, "radius_weight": 1.0, "nms_radius": 0.3,
+                   "position_loss": p_form}
+            v = _validate(fwd, params, buckets, ex, lambda x: x, ["up", "down"], wkw, 4, pool)
+            objs.add(round(v["objective"], 10))
     assert len(objs) == 1
+
+
+def test_old_checkpoint_with_energy_head_loads(tmp_path):
+    """Checkpoints from before the energy was dropped carry EnergyHead_0 / atom_ref modules;
+    they are ignored, and the Wannier weights load unchanged."""
+    from flax import serialization
+    from model.model import model_from_config
+    from training.train import load_params
+    ex = molecules(2)
+    model = model_from_config(CFG)
+    params = model.init(jax.random.PRNGKey(0), ex[0]["z"], ex[0]["pos"])
+    old = {**params, "params": {**params["params"],
+                                "EnergyHead_0": {"e0": {"kernel": np.ones((16, 16))}},
+                                "atom_ref": {"embedding": np.zeros((10, 1))}}}
+    (tmp_path / "old.msgpack").write_bytes(serialization.to_bytes(old))
+    loaded = load_params(tmp_path / "old.msgpack", params)
+    assert set(loaded["params"]) == set(params["params"])
+    for a, b in zip(jax.tree_util.tree_leaves(loaded), jax.tree_util.tree_leaves(params)):
+        np.testing.assert_allclose(a, b)

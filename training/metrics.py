@@ -1,20 +1,14 @@
-"""Eval metrics (CLAUDE.md §10): energy MAE and an interpretable Wannier-center accuracy.
+"""Eval metrics (CLAUDE.md §10): an interpretable Wannier-center and radius accuracy.
 
 The Wannier metric Hungarian-matches predicted centers to true ones and reports distances in Å.
-Matching is fine HERE (scoring a finished prediction); CLAUDE.md §6 rejects it only as a
-training LOSS (needs padding, poor gradients) — the loss stays the Gaussian cloud.
+The same Hungarian matching is used by the training loss (losses/wannier_match.py); here it
+scores the k selected centers of a finished prediction.
 """
 
 from __future__ import annotations
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
-
-
-def energy_mae(apply_fn, params, examples) -> float:
-    errs = [abs(float(apply_fn(params, ex["z"], ex["pos"])["energy"]) - float(ex["energy"]))
-            for ex in examples]
-    return float(np.mean(errs)) if errs else float("nan")
 
 
 def match_wannier(pred_c, pred_r, k, true_c, true_r):
@@ -51,6 +45,8 @@ def wannier_summary(matches):
         "center_rmse": float(np.sqrt((dist ** 2).mean())) if some else float("nan"),
         "center_median": float(np.median(dist)) if some else float("nan"),
         "center_p95": float(np.percentile(dist, 95)) if some else float("nan"),
+        "frac_within_0.1": float((dist < 0.1).mean()) if some else float("nan"),   # Å
+        "frac_over_1.0": float((dist > 1.0).mean()) if some else float("nan"),     # Å
         "radius_mae": float(np.abs(rerr).mean()) if some else float("nan"),
         "count_accuracy": float((count_err == 0).mean()) if len(count_err) else float("nan"),
         "count_error_breakdown": {int(v): int(c) for v, c in zip(vals, cnts)},

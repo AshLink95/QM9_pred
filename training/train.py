@@ -66,7 +66,7 @@ def _pad_wannier(ex, n_spins, kmax):
 
 def stack_buckets(examples, n_spins, kmax):
     """Group molecules by atom count and stack each group into arrays (done once).
-    Returns {n_atoms: {z, pos, energy, centers, radii, k, index}}; `index` = position in
+    Returns {n_atoms: {z, pos, centers, radii, k, index}}; `index` = position in
     `examples`."""
     groups = defaultdict(list)
     for i, e in enumerate(examples):
@@ -78,7 +78,6 @@ def stack_buckets(examples, n_spins, kmax):
         buckets[n] = {
             "z": np.stack([e["z"] for e in exs]).astype(np.int32),
             "pos": np.stack([e["pos"] for e in exs]).astype(np.float32),
-            "energy": np.array([e["energy"] for e in exs], np.float32),
             "centers": np.stack([c for c, _ in cr]),
             "radii": np.stack([r for _, r in cr]),
             "k": np.stack([centers_per_spin(e["z"], n_spins) for e in exs]),
@@ -156,48 +155,18 @@ def _prefetch(items, make, depth=2):
 
 
 # ------------------------------------------------------------------ loss
-def _energy_loss(pred, true, ekw):
-    """"l1": mean |ΔE|/σ_E (σ_E = train residual std after the per-element reference; EGNN's
-    QM9 recipe trains on L1 of normalized targets). "mse": mean ΔE² in eV² (the earlier loss; its
-    weight shrinks quadratically as the energy improves)."""
-    if ekw["form"] == "l1":
-        return jnp.mean(jnp.abs(pred - true)) / ekw["e_std"]
-    if ekw["form"] == "mse":
-        return jnp.mean((pred - true) ** 2)
-    raise ValueError(f"loss.energy_loss must be 'l1' or 'mse', got {ekw['form']!r}")
-
-
-def _batch_loss(params, model, batch, perm, lam_e, lam_w, wkw, ekw):
-    """λ_E·energy loss + λ_W·(matched Wannier loss, per spin). `perm` comes from the host
-    pairing; `wkw`/`ekw` hold the Wannier/energy loss settings (python values)."""
+def _batch_loss(params, model, batch, perm, wkw):
+    """The matched Wannier loss, per spin — the only training objective (CLAUDE.md §1, §6).
+    `perm` comes from the host pairing; `wkw` holds the loss settings (python values)."""
     out = jax.vmap(lambda z, p: model.apply(params, z, p))(batch["z"], batch["pos"])
-    e = _energy_loss(out["energy"], batch["energy"], ekw)
-    zero = jnp.zeros(())
-    w, parts = zero, {"pos": zero, "radius": zero, "select": zero, "guide": zero}
-    if lam_w > 0:
-        o = out["wannier"]
-        w, parts = wannier_match_loss(o["centers"], o["radii"], o["logits"], batch["centers"],
-                                      batch["radii"], batch["k"], perm, **wkw)
-    return lam_e * e + lam_w * w, {"E": e, "W": w, **parts}
+    o = out["wannier"]
+    return wannier_match_loss(o["centers"], o["radii"], o["logits"], batch["centers"],
+                              batch["radii"], batch["k"], perm, **wkw)
 
 
 def _finite(tree):
     """True iff every array leaf is free of NaN/inf."""
     return all(bool(np.all(np.isfinite(np.asarray(x)))) for x in jax.tree_util.tree_leaves(tree))
-
-
-def _fit_atom_ref(examples, n_elements):
-    """Least-squares per-element reference energies: E_mol ≈ sum_atoms ref[Z].
-    Returns (ref tuple of length n_elements, residual std in eV). Deterministic statistic of
-    the TRAIN targets — used only to initialize the model's per-element energy offset."""
-    counts = np.zeros((len(examples), n_elements))
-    for i, e in enumerate(examples):
-        np.add.at(counts[i], e["z"], 1)
-    energies = np.array([e["energy"] for e in examples])
-    present = counts.any(axis=0)
-    ref = np.zeros(n_elements)
-    ref[present] = np.linalg.lstsq(counts[:, present], energies, rcond=None)[0]
-    return tuple(float(r) for r in ref), float(np.std(energies - counts @ ref))
 
 
 def _fit_radius(examples):
@@ -221,45 +190,40 @@ def make_lr(tc, spe):
 
 
 # ------------------------------------------------------------------ validation
-def _validate(fwd, params, buckets, examples, put, spins, lam_e, lam_w, wkw, ekw, batch_size,
-              pool):
+def _validate(fwd, params, buckets, examples, put, spins, wkw, batch_size, pool):
     """Predict every validation molecule once, select k centers per spin exactly as at
     prediction time (top logits + NMS), pair them with the truth on the host, and compute:
 
-        objective = λ_E·E_MAE/σ_E + λ_W·(center MAE + radius_weight·radius MAE/r_std)
+        objective = center MAE + radius_weight · radius MAE / r_std
 
     It doesn't depend on the loss forms (l1/mse), so runs that differ only in those are compared
-    on the same scale (σ_E, r_std come from the shared train split). Lower is better."""
+    on the same scale (r_std comes from the shared train split). Lower is better."""
     S = len(spins)
-    e_err, jobs = [], []
+    n_mol, jobs = 0, []
     for n, idx, real in eval_batches(buckets, batch_size):
         b = _gather(buckets, n, idx)
         out = jax.device_get(fwd(params, put(b["z"]), put(b["pos"])))
         sel = select_centers(out["wannier"], b["k"], wkw["nms_radius"])
         for j in range(real):
             ex = examples[buckets[n]["index"][idx[j]]]
-            e_err.append(float(out["energy"][j]) - float(ex["energy"]))
+            n_mol += 1
             for s in range(S):
                 w = ex["wannier"][s]
                 jobs.append((s, sel["centers"][j, s], sel["radii"][j, s],
                              int(b["k"][j, s]), w["centers"], w["radii"]))
     matches = list(pool.map(lambda a: (a[0], match_wannier(*a[1:])), jobs))
-    e_err = np.array(e_err)
     d = {s: np.array([p[2] for ss, m in matches if ss == s for p in m["pairs"]]) for s in range(S)}
     rerr = np.array([p[3] for _, m in matches for p in m["pairs"]])
     alld = np.concatenate([d[s] for s in range(S)])
     c_mae = float(np.mean(alld)) if len(alld) else 0.0
     r_mae = float(np.mean(np.abs(rerr))) if len(rerr) else 0.0
-    obj = (lam_e * float(np.mean(np.abs(e_err))) / ekw["e_std"]
-           + lam_w * (c_mae + wkw["radius_weight"] * r_mae / wkw["r_std"]))
     return {
-        "objective": obj,
-        "energy_mae": float(np.mean(np.abs(e_err))),
+        "objective": c_mae + wkw["radius_weight"] * r_mae / wkw["r_std"],
         "center_mae": {spins[s]: float(d[s].mean()) if len(d[s]) else float("nan")
                        for s in range(S)},
         "radius_mae": float(np.mean(np.abs(rerr))) if len(rerr) else float("nan"),
         "count_accuracy": float(np.mean([m["n_pred"] == m["n_true"] for _, m in matches])),
-        "n_molecules": len(e_err),
+        "n_molecules": n_mol,
     }
 
 
@@ -274,7 +238,14 @@ def save_params(path, params):
 
 
 def load_params(path, template):
-    return serialization.from_bytes(template, Path(path).read_bytes())
+    """Load parameters into `template`'s structure. Modules the checkpoint has but the model
+    doesn't (e.g. `EnergyHead_0` / `atom_ref` in checkpoints from before the energy was
+    dropped) are ignored, so older Wannier models still load; missing modules still error."""
+    raw = serialization.msgpack_restore(Path(path).read_bytes())
+    tp, rp = template.get("params", {}), raw.get("params", {})
+    if isinstance(rp, dict) and isinstance(tp, dict):
+        raw = {**raw, "params": {k: v for k, v in rp.items() if k in tp}}
+    return serialization.from_state_dict(template, raw)
 
 
 def _atomic_write(path, data: bytes):
@@ -300,7 +271,6 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
     is returned (used for graceful preemption)."""
     tc, wc = cfg["train"], cfg["wannier"]
     spins = wc["spins"]; n_spins = len(spins); kmax = wc["max_centers"]
-    lam_e, lam_w = cfg["loss"]["lambda_energy"], cfg["loss"]["lambda_wannier"]
     B, ckpt_every, patience = tc["batch_size"], tc.get("ckpt_every", 10), tc.get("patience", 0)
     should_stop = should_stop or (lambda: False)
 
@@ -342,11 +312,6 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
     print(f"train {len(train_ex)}  val {len(val_ex)}  max_centers {kmax}  batch_size {B}  "
           f"steps/epoch {spe}", flush=True)
 
-    atom_ref, resid_std = _fit_atom_ref(train_ex, cfg["model"]["n_elements"])
-    print("atom_ref (eV): " + "  ".join(f"Z{z}={r:.3f}" for z, r in enumerate(atom_ref) if r),
-          flush=True)
-    print(f"energy residual std after ref: {resid_std:.4f} eV  (what the network must learn)",
-          flush=True)
     r_mean, r_std = _fit_radius(train_ex)
     print(f"Wannier radius: mean {r_mean:.4f} A, std {r_std:.4f} A  (radius output starts at "
           f"the mean)", flush=True)
@@ -356,12 +321,11 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
            "select_weight": wc.get("select_weight", 1.0),
            "position_loss": wc.get("position_loss", "mse"),
            "nms_radius": wc.get("nms_radius", 0.0), "layout": layout}
-    ekw = {"form": cfg["loss"].get("energy_loss", "mse"), "e_std": max(resid_std, 1e-6)}
     ema_decay = float(tc.get("ema_decay", 0.0))
-    print(f"losses: energy {ekw['form']}, positions {wkw['position_loss']}, NMS radius "
+    print(f"loss: positions {wkw['position_loss']}, NMS radius "
           f"{wkw['nms_radius']} A, EMA decay {ema_decay}", flush=True)
 
-    model = model_from_config(cfg, atom_ref=atom_ref, radius_init=r_mean)
+    model = model_from_config(cfg, radius_init=r_mean)
     params = model.init(jax.random.PRNGKey(tc["seed"]),
                         jnp.asarray(train_ex[0]["z"]), jnp.asarray(train_ex[0]["pos"]))
     lr, lr_at = make_lr(tc, spe)
@@ -412,7 +376,7 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
 
     def _step(prm, ema_, ost, batch, perm):
         (loss, aux), grads = jax.value_and_grad(_batch_loss, has_aux=True)(
-            prm, model, batch, perm, lam_e, lam_w, wkw, ekw)
+            prm, model, batch, perm, wkw)
         updates, ost = opt.update(grads, ost, prm)
         prm = optax.apply_updates(prm, updates)
         # exponential moving average of the weights (decay 0 -> the weights themselves)
@@ -422,7 +386,6 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
     step = jax.jit(_step, out_shardings=repl)
 
     workers = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
-    zero_perm = put(np.zeros((B, n_spins, kmax), np.int32))     # unused when lam_w == 0
     status = "finished"
 
     def make_batch(item):
@@ -444,10 +407,9 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
             batches = _prefetch(epoch_batches(train_b, B, rng), make_batch)
             records, stopped = [], False
             cur = next(batches)
-            perm = (pairing(cur[0], fwd(params, cur[1]["z"], cur[1]["pos"])["wannier"]["centers"])
-                    if lam_w > 0 else zero_perm)
+            perm = pairing(cur[0], fwd(params, cur[1]["z"], cur[1]["pos"])["wannier"]["centers"])
             for nxt in _chain(batches):
-                if nxt is not None and lam_w > 0:   # predict NEXT batch with current params...
+                if nxt is not None:                 # predict NEXT batch with current params...
                     nxt_out = fwd(params, nxt[1]["z"], nxt[1]["pos"])
                 params, ema, opt_state, loss, aux = step(params, ema, opt_state, cur[1],
                                                          perm)                       # ...train
@@ -458,7 +420,7 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
                 if nxt is None:
                     break
                 # CPU pairs the next batch while the GPU runs the step above
-                perm = pairing(nxt[0], nxt_out["wannier"]["centers"]) if lam_w > 0 else zero_perm
+                perm = pairing(nxt[0], nxt_out["wannier"]["centers"])
                 cur = nxt
             batches.close()
 
@@ -467,8 +429,8 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
             if not np.all(np.isfinite(losses)):
                 bad = int(np.argmax(~np.isfinite(losses)))
                 a = vals[bad][1]
-                print(f"NON-FINITE loss at epoch {epoch} step {bad}: E-loss {float(a['E']):.3e}  "
-                      f"W-loss {float(a['W']):.3e} — reverting to the epoch-start state and "
+                print(f"NON-FINITE loss at epoch {epoch} step {bad}: pos {float(a['pos']):.3e}  "
+                      f"radius {float(a['radius']):.3e} — reverting to the epoch-start state and "
                       f"stopping", flush=True)
                 params, ema, opt_state = start_params, start_ema, start_opt
                 save_state(epoch)
@@ -484,14 +446,12 @@ def train_with_status(cfg, examples, ckpt_path=None, should_stop=None):
             if epoch % ckpt_every == 0 or last_epoch:
                 mean = lambda key: float(np.mean([float(a[key]) for _, a in vals]))
                 line = (f"epoch {epoch:4d}  lr {lr_at((epoch + 1) * spe):.2e}  train "
-                        f"{losses.mean():.4f} (E {mean('E'):.4f}  W {mean('W'):.4f} = pos "
-                        f"{mean('pos'):.4f}, radius {mean('radius'):.4f}, select "
+                        f"{losses.mean():.4f} (pos {mean('pos'):.4f}, radius {mean('radius'):.4f}, select "
                         f"{mean('select'):.4f}, guide {mean('guide'):.4f})")
                 if val_b:
-                    v = _validate(fwd, ema, val_b, val_ex, put, spins, lam_e, lam_w, wkw, ekw,
-                                  B, pool)
+                    v = _validate(fwd, ema, val_b, val_ex, put, spins, wkw, B, pool)
                     centers = "/".join(f"{x:.4f}" for x in v["center_mae"].values())
-                    line += (f" | val obj {v['objective']:.4f}  E-MAE {v['energy_mae']:.4f} eV  "
+                    line += (f" | val obj {v['objective']:.4f}  "
                              f"center {'/'.join(spins)} {centers} A  radius "
                              f"{v['radius_mae']:.4f} A")
                     if v["objective"] < float(state["best_obj"]):

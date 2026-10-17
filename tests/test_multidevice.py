@@ -11,7 +11,7 @@ from tests._fake import WANNIER_CFG, molecules
 from training.train import train_with_status
 cfg = {"model": {"hidden_dim": 16, "n_layers": 2, "n_elements": 10,
                  "rbf": {"enabled": True, "n_basis": 8, "cutoff": 10.0}},
-       "wannier": WANNIER_CFG, "loss": {"lambda_energy": 1.0, "lambda_wannier": 1.0},
+       "wannier": WANNIER_CFG,
        "train": {"lr": 5e-3, "batch_size": 4, "epochs": 2, "ckpt_every": 1, "seed": 0,
                  "split_seed": 0, "val_frac": 0.25, "test_frac": 0.25}}
 params, status = train_with_status(cfg, molecules(12))

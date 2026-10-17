@@ -15,7 +15,6 @@ BASE = {
     "model": {"hidden_dim": 16, "n_layers": 2, "n_elements": 10,
               "rbf": {"enabled": True, "n_basis": 8, "cutoff": 10.0}},
     "wannier": WANNIER_CFG,
-    "loss": {"lambda_energy": 1.0, "lambda_wannier": 1.0},
     "train": {"lr": 5e-3, "batch_size": 4, "epochs": 2, "ckpt_every": 1, "seed": 0,
               "split_seed": 0, "val_frac": 0.25, "test_frac": 0.25, "patience": 0,
               "lr_schedule": "cosine", "warmup_epochs": 1, "lr_end_frac": 0.01},
@@ -104,7 +103,7 @@ def test_tiny_sweep_end_to_end(tmp_path):
     assert q.names("finished") == ["final", "r0", "r1"]
     for name in ("r0", "r1", "final"):
         assert (q.root / name / "report" / "summary.txt").exists()
-        assert json.loads((q.root / name / "result.json").read_text())["test_energy_mae"] > 0
+        assert json.loads((q.root / name / "result.json").read_text())["test_center_mae"] > 0
     table = sweep.status(path)
     assert "final" in table and "r0" in table and " *" in table
 
@@ -125,7 +124,7 @@ def test_shipped_sweep_resolves():
 
 
 def test_promote_false_run_is_never_promoted(tmp_path):
-    """A diagnostic run (`promote: false`, e.g. energy only) is skipped even with the best score."""
+    """A diagnostic run (`promote: false`) is skipped even with the best score."""
     _, spec = _spec(tmp_path, n_runs=2)
     spec["runs"][1]["promote"] = False
     q = sweep.RunQueue(sweep.sweep_root(spec))

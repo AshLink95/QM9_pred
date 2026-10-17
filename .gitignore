@@ -24,3 +24,5 @@ accuracy_report/
 
 # Misc.
 *.png
+accuracy.tar.xz
+accuracy.tar.gz

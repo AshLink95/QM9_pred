@@ -46,10 +46,10 @@ prediction:
 
 | Test | Assertion | What it proves |
 |---|---|---|
-| `test_translation` | energy unchanged; `centers_out == centers + t` | translation equivariance |
-| `test_rotation` | energy unchanged; `centers_out == centers @ Rᵀ`; radii unchanged | rotation equivariance |
-| `test_permutation` | energy unchanged; candidates, radii, logits permuted **with their atoms** | atom-order invariance of the set |
-| `test_mirror` | energy unchanged; singles `== centers @ Mᵀ`; each ± pair reflects with its two members **swapped**; radii/logits unchanged | reflection equivariance |
+| `test_translation` | `centers_out == centers + t` | translation equivariance |
+| `test_rotation` | `centers_out == centers @ Rᵀ`; radii unchanged | rotation equivariance |
+| `test_permutation` | candidates, radii, logits permuted **with their atoms** | atom-order invariance of the set |
+| `test_mirror` | singles `== centers @ Mᵀ`; each ± pair reflects with its two members **swapped**; radii/logits unchanged | reflection equivariance |
 | `test_selected_set_same_in_every_frame` | the k selected centers of a molecule rotated, moved 100 Å away and listed in reverse are the original set, transformed | "same molecule, same answer, however presented" |
 
 All at `atol=1e-8` (the last at `1e-7`). Candidates belong to atoms ([model](model.md) §5), so a
@@ -72,7 +72,7 @@ message or `φ_x` returned more than a scalar; broken permutation ⇒ a non-sum 
 
 ## 4. The chirality caveat (CLAUDE.md §8)
 Pure distances are reflection-invariant, and this architecture has **no chiral feature**, so the
-mirror test passes exactly — mirror in, mirror out. That's correct for energy and centers here.
+mirror test passes exactly — mirror in, mirror out. That's correct for Wannier centers here.
 *If* you ever needed to distinguish enantiomers (a genuinely chiral target), you'd add a signed
 feature (a triple product / signed volume of edge vectors) and then the mirror test *should*
 legitimately differ on that target. Don't add it preemptively.

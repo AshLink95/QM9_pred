@@ -1,8 +1,8 @@
-"""Parse SIESTA input/output: geometry from `.fdf`, total energy from `.out` (CLAUDE.md §9).
+"""Parse SIESTA input geometry from `.fdf` (CLAUDE.md §9).
 
-Stage-1 data code (no learning). Returns atomic numbers `Z`, positions in Angstrom, and the
-converged total energy in eV. The `.out` trial-projector Wannier centers are NOT parsed here
-(§1) — they are never used.
+Stage-1 data code (no learning). Returns atomic numbers `Z` and positions in Angstrom. The
+SIESTA `.out` log is not read at all: the model predicts only Wannier targets (from the `.wout`),
+and the `.out` trial-projector centers are never used (§1).
 
 We deliberately prefer the clean `.fdf` for geometry over `.out` coordinate dumps, which can
 be duplicated/truncated in the log.
@@ -106,16 +106,3 @@ def parse_fdf(fdf_path: str | Path) -> tuple[np.ndarray, np.ndarray]:
         zs.append(sp2z[species])
     return np.array(zs, dtype=np.int32), np.array(pos, dtype=np.float64)
 
-
-# Converged total energy. SIESTA prints many "siesta: Total = ..." lines during SCF; the last
-# one is the converged value (§1: targets are the final minimized values).
-_TOTAL_RE = re.compile(r"siesta:\s*Total\s*=\s*(-?\d+\.?\d*)")
-
-
-def parse_energy(out_path: str | Path) -> float:
-    """`.out` -> converged total energy (eV). Takes the LAST 'siesta: Total =' match."""
-    text = Path(out_path).read_text()
-    matches = _TOTAL_RE.findall(text)
-    if not matches:
-        raise ValueError(f"No 'siesta: Total =' line found in {out_path}")
-    return float(matches[-1])

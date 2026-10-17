@@ -63,12 +63,12 @@ Flax describes a network as a `Module` (a dataclass) whose `__call__` defines th
 ```python
 import flax.linen as nn
 
-class EnergyHead(nn.Module):
+class PerAtomScore(nn.Module):           # a toy module: one number per atom
     hidden_dim: int                     # hyperparameters = dataclass fields
 
     @nn.compact                         # lets you declare layers inline in __call__
     def __call__(self, h):
-        return jnp.sum(nn.Dense(1)(nn.silu(nn.Dense(self.hidden_dim)(h))))
+        return nn.Dense(1)(nn.silu(nn.Dense(self.hidden_dim)(h)))
 ```
 
 - **Fields** (`hidden_dim: int`) are static configuration, set when you construct the module.
@@ -118,7 +118,7 @@ This split is the whole reason JAX can `grad` the network: `apply` is a plain fu
 - **`jax.grad(f)`** returns a function computing `∂f/∂(first arg)`. `f` must return a scalar.
 - **`jax.value_and_grad(f)`** returns `(f(x), grad)` in one pass — you usually want the loss
   value *and* its gradient. With `has_aux=True`, `f` returns `(scalar, aux)` and you get
-  `((scalar, aux), grad)` (the loss code returns `(total, {"energy":..., "wannier":...})`).
+  `((scalar, aux), grad)` (the loss code returns `(total, {"pos":..., "radius":..., ...})`).
 - **`jax.vmap(f)`** auto-vectorizes `f` over a new batch axis. Training uses it on every step:
   `jax.vmap(lambda z, p: model.apply(params, z, p))` runs a whole batch of same-size molecules at
   once ([training](training.md) §1–2). Batches are grouped by atom count so shapes match.

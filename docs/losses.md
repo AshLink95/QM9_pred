@@ -1,31 +1,23 @@
-# `losses/` — energy regression + the matched Wannier loss
+# `losses/` — the matched Wannier loss
 
 Scores what [model](model.md) predicts against the parsed targets from [data](data.md); the
 scalar it returns is what [training](training.md) differentiates. Syntax:
 [jax_flax_primer](jax_flax_primer.md). Rationale: `../CLAUDE.md` §6 (the load-bearing decision,
 including the "Revised loss" and why the first version was replaced).
 
-Files: `energy.py` (trivial), `wannier_match.py` (the Wannier loss), `wannier_cloud.py` (the
-closed-form Gaussian overlap, used as the fixed-width guide term).
+Files: `wannier_match.py` (the Wannier loss), `wannier_cloud.py` (the closed-form Gaussian
+overlap, used as the fixed-width guide term).
 
 ---
 
-## 1. `energy.py`
+## 1. One objective
 
-```python
-def energy_loss(pred_energy, true_energy):
-    return jnp.mean((pred_energy - true_energy) ** 2)
-```
-
-Plain mean-squared error on one invariant scalar — the simplest form. Training uses
-`training/train.py:_energy_loss`, chosen by `loss.energy_loss`:
-- **`l1` (default):** `mean |ΔE| / σ_E`, where σ_E is the training set's energy spread left after
-  the per-element reference (printed at startup). This is EGNN's QM9 recipe (L1 loss on
-  normalized targets, [refs](refs.md)). Two reasons: it scores what we report (mean absolute
-  error), and it keeps the energy term on the same scale as the Wannier terms.
-- **`mse`:** `mean ΔE²` in eV² (the earlier loss). Its trouble: at 0.05 eV error it is 0.0025,
-  next to a Wannier term of ~0.4, and it shrinks quadratically as the energy improves, so late
-  in training the energy gets almost no gradient.
+The loss is the Wannier loss alone (§3). A total-energy term (energy MSE, later L1 on the
+normalized energy) shared the loss up to v3; it was removed because the two objectives traded
+off through the shared network — better centers came with worse energy and vice versa
+(CLAUDE.md §1, [refs](refs.md): negative transfer). Every term below describes the same predicted
+set of centers; the weights only balance its aspects (position, size, which candidates, a smooth
+guide).
 
 ## 2. The problem: comparing two unordered sets
 
@@ -115,9 +107,8 @@ total = pos + radius_weight·rad + select_weight·select + guide_weight·guide
   training the pairing can flip
   from step to step. The guide doesn't care about pairing and gives a smooth pull toward the
   right region. Because its width is fixed, it can't be gamed by widening blobs.
-- Weights come from `configs/*.yaml` (`wannier.radius_weight`, `select_weight`, `guide_weight`); the
-  whole Wannier term is scaled by `loss.lambda_wannier` (0 in `energy_only.yaml` skips it
-  entirely).
+- Weights come from `configs/*.yaml` (`wannier.radius_weight`, `select_weight`,
+  `guide_weight`). There is no other term to weigh them against.
 
 ## 4. `wannier_cloud.py` — the closed-form overlap (now the guide)
 

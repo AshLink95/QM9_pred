@@ -1,4 +1,4 @@
-"""Accuracy report: parsed truth vs model output for energy + Wannier centers (CLAUDE.md §10).
+"""Accuracy report: parsed truth vs model output for Wannier centers and radii (CLAUDE.md §10).
 
 Used by `scripts/evaluate.py`. Pure evaluation — nothing here is imported by training.
 
@@ -34,18 +34,16 @@ def formula(z) -> str:
 
 # ------------------------------------------------------------------------ loading
 def load_fresh(dirs, spins):
-    """Parse a fresh data set: every .fdf under `dirs` (recursive), with its .out and per-spin
-    .wout matched by molecule id across all roots. Returns (examples with "id", skipped)."""
+    """Parse a fresh data set: every .fdf under `dirs` (recursive), with its per-spin .wout
+    matched by molecule id across all roots. Returns (examples with "id", skipped)."""
     # ponytail: mirrors data/dataset.py:build_dataset only to keep each molecule's id without
     # changing dataset code (frozen this round). Fold back into build_dataset when the dataset
     # format is revisited.
     fdfs = sorted(f for d in dirs for f in Path(d).rglob("*.fdf"))
-    outs, wouts = _index(dirs, "out"), _index(dirs, "wout")
+    wouts = _index(dirs, "wout")
     examples, skipped = [], []
     for f in fdfs:
         mid = _mol_id(f)
-        if mid not in outs:
-            skipped.append((mid, "no .out")); continue
         wout_by_spin = {}
         for spin in spins:
             match = [p for p in wouts.get(mid, []) if spin in p.name]
@@ -54,7 +52,7 @@ def load_fresh(dirs, spins):
         if len(wout_by_spin) < len(spins):
             skipped.append((mid, "missing spin .wout")); continue
         try:
-            ex = load_molecule(f, outs[mid][0], wout_by_spin, spins)
+            ex = load_molecule(f, wout_by_spin, spins)
         except Exception as err:                      # malformed / unconverged file
             skipped.append((mid, str(err))); continue
         ex["id"] = mid
@@ -91,15 +89,14 @@ def predict_all(model, params, examples, batch_size=256, nms=0.0):
                           for i in padded])
             w = select_centers(res["wannier"], k, nms)   # the k selected centers first
             for j, i in enumerate(chunk):
-                out[i] = {"energy": float(res["energy"][j]), "centers": w["centers"][j],
-                          "radii": w["radii"][j]}
+                out[i] = {"centers": w["centers"][j], "radii": w["radii"][j]}
     return out
 
 
 def rotation_drift(model, params, ex, nms=0.0):
-    """Symmetry spot-check on one molecule: rotate the input; the energy should not change and
-    the selected center set should rotate with it. Sets are compared after matching, so float
-    noise that swaps two near-equal logits doesn't count. Returns (eV, Å) maxima."""
+    """Symmetry spot-check on one molecule: rotate the input; the selected center set should
+    rotate with it. Sets are compared after matching, so float noise that swaps two near-equal
+    logits doesn't count. Returns the largest center displacement (Å)."""
     z, pos = np.asarray(ex["z"]), np.asarray(ex["pos"])
     base = model.apply(params, z, pos)
     R = T.random_rotation(seed=0)
@@ -111,7 +108,7 @@ def rotation_drift(model, params, ex, nms=0.0):
         m = match_wannier(rs["centers"][s], rs["radii"][s], ks, bs["centers"][s][:ks] @ R.T,
                           bs["radii"][s][:ks])
         drift = max([drift] + [p[2] for p in m["pairs"]])
-    return abs(float(rot["energy"]) - float(base["energy"])), float(drift)
+    return float(drift)
 
 
 # ------------------------------------------------------------------------ comparison
@@ -119,20 +116,14 @@ def _f(x, nd=6):
     return "" if x is None else round(float(x), nd)
 
 
-def build_report(examples, preds, names, spins, atom_ref=None):
+def build_report(examples, preds, names, spins):
     """Compare truth vs prediction. Returns (molecule_rows, center_rows, summary, data) where
     `data` holds the raw arrays the figure is drawn from."""
     mol_rows, center_rows = [], []
     by_spin = {s: [] for s in spins}
-    e_true, e_pred, e_base = [], [], []
     r_true, r_pred = [], []                       # matched-pair radii, for the parity panel
     for ex, pr, name in zip(examples, preds, names):
-        et, ep = float(ex["energy"]), pr["energy"]
-        e_true.append(et); e_pred.append(ep)
-        if atom_ref is not None:
-            e_base.append(float(np.sum(atom_ref[np.asarray(ex["z"])])))
-        row = {"molecule": name, "formula": formula(ex["z"]), "n_atoms": len(ex["z"]),
-               "E_true_eV": _f(et), "E_pred_eV": _f(ep), "E_err_eV": _f(ep - et)}
+        row = {"molecule": name, "formula": formula(ex["z"]), "n_atoms": len(ex["z"])}
         k = centers_per_spin(ex["z"], len(spins))          # predicted count per spin
         for s, spin in enumerate(spins):
             tc, tr = ex["wannier"][s]["centers"], ex["wannier"][s]["radii"]
@@ -157,15 +148,10 @@ def build_report(examples, preds, names, spins, atom_ref=None):
                     center_rows.append(_center_row(name, spin, "extra", None, None, pr, s, p))
         mol_rows.append(row)
 
-    err = np.array(e_pred) - np.array(e_true)
     summary = {"n_molecules": len(examples),
-               "energy": _err_stats(err),
-               "energy_baseline": _err_stats(np.array(e_base) - np.array(e_true))
-               if e_base else None,
                "wannier": {spin: wannier_summary(ms) for spin, ms in by_spin.items()}}
     summary["wannier"]["all"] = wannier_summary([m for ms in by_spin.values() for m in ms])
-    data = {"e_true": np.array(e_true), "e_pred": np.array(e_pred), "by_spin": by_spin,
-            "radii_true": np.array(r_true), "radii_pred": np.array(r_pred)}
+    data = {"by_spin": by_spin, "radii_true": np.array(r_true), "radii_pred": np.array(r_pred)}
     return mol_rows, center_rows, summary, data
 
 
@@ -184,32 +170,18 @@ def _center_row(name, spin, status, tc, tr, pr=None, s=None, p=None, dist=None):
     return row
 
 
-def _err_stats(err):
-    a = np.abs(err)
-    return {"mae": float(a.mean()), "rmse": float(np.sqrt((err ** 2).mean())),
-            "median_abs": float(np.median(a)), "p95_abs": float(np.percentile(a, 95)),
-            "max_abs": float(a.max()), "bias": float(err.mean())} if len(err) else {}
-
-
 # ------------------------------------------------------------------------ outputs
 def format_summary(summary, header_lines=()):
     L = list(header_lines)
-    e, b = summary["energy"], summary["energy_baseline"]
-    L += ["", "ENERGY (eV)        MAE        RMSE       median|err|  p95|err|   max|err|   bias",
-          f"  model        {e['mae']:10.4f} {e['rmse']:10.4f} {e['median_abs']:12.4f} "
-          f"{e['p95_abs']:10.4f} {e['max_abs']:10.4f} {e['bias']:+9.4f}"]
-    if b:
-        L.append(f"  composition  {b['mae']:10.4f} {b['rmse']:10.4f} {b['median_abs']:12.4f} "
-                 f"{b['p95_abs']:10.4f} {b['max_abs']:10.4f} {b['bias']:+9.4f}"
-                 "   <- sum of per-element references only (what the network must beat)")
     L += ["", "WANNIER CENTERS per spin (Hungarian-matched; predicted count = valence "
               "electrons / 2, so 'count acc' checks that rule against the .wout)",
-          "  spin   matched  center MAE  RMSE     median   p95      radius MAE  count acc"
-          "   count error (pred-true): n"]
+          "  spin   matched  center MAE  RMSE     median   p95      <0.1A    >1A      radius MAE"
+          "  count acc   count error (pred-true): n"]
     for spin, w in summary["wannier"].items():
         brk = "  ".join(f"{k:+d}:{v}" for k, v in sorted(w["count_error_breakdown"].items()))
         L.append(f"  {spin:<6} {w['n_matched']:8d}  {w['center_mae']:9.4f}  "
                  f"{w['center_rmse']:7.4f}  {w['center_median']:7.4f}  {w['center_p95']:7.4f}  "
+                 f"{100 * w['frac_within_0.1']:6.2f}%  {100 * w['frac_over_1.0']:6.2f}%  "
                  f"{w['radius_mae']:9.4f}  {100 * w['count_accuracy']:8.2f}%   {brk}")
     L += ["  (distances in Angstrom)", "",
           "Reference: Deep Wannier (Zhang et al., PRB 102, 041121, 2020) reports ~0.003-0.005 A",
@@ -263,8 +235,7 @@ def _beyond(n, unit_lim):
     return f"   ({n} beyond {unit_lim} not shown)" if n else ""
 
 
-PLOTS = ("energy_error_vs_energy.png", "energy_error_hist.png", "center_error_hist.png",
-         "radius_parity.png", "molecule_center_error_hist.png")
+PLOTS = ("center_error_hist.png", "radius_parity.png", "molecule_center_error_hist.png")
 
 
 def _figures(out_dir, data):
@@ -288,36 +259,7 @@ def _figures(out_dir, data):
         fig.savefig(out / name, dpi=150, facecolor=_SURF)
         plt.close(fig)
 
-    et, ep = data["e_true"], data["e_pred"]
-    err = ep - et
     matches = [m for ms in data["by_spin"].values() for m in ms]
-
-    # energy error vs energy (a parity plot hides eV-scale errors on a ~1e3 eV axis)
-    fig, ax = new(); note = ""
-    if len(et):
-        lim = np.percentile(np.abs(err), 99.5) or 1.0
-        keep = np.abs(err) <= lim
-        hb = ax.hexbin(et[keep], err[keep], gridsize=60, cmap=seq, mincnt=1, norm=LogNorm(),
-                       linewidths=0)
-        ax.axhline(0, color=_MUTED, linewidth=1, linestyle="--")
-        _cbar(fig, hb, ax, "molecules per cell")
-        note = _beyond(int((~keep).sum()), f"±{lim:.3g} eV")
-    _style(ax, "Energy error vs SIESTA energy", "SIESTA total energy (eV)" + note,
-           "predicted − SIESTA (eV)")
-    save(fig, PLOTS[0])
-
-    # energy error histogram
-    fig, ax = new(); note = ""
-    if len(err):
-        lim = np.percentile(np.abs(err), 99.5) or 1.0
-        ax.hist(err, bins=80, range=(-lim, lim), color=_SERIES[0], edgecolor=_SURF,
-                linewidth=0.5)
-        ax.axvline(0, color=_MUTED, linewidth=1)
-        ax.text(0.02, 0.95, f"MAE {np.abs(err).mean():.4f} eV\nbias {err.mean():+.4f} eV",
-                transform=ax.transAxes, va="top", color=_INK2, fontsize=9)
-        note = _beyond(int((np.abs(err) > lim).sum()), f"±{lim:.3g} eV")
-    _style(ax, "Energy error (predicted − SIESTA)", "error (eV)" + note, "molecules")
-    save(fig, PLOTS[1])
 
     # matched center distances, both spins
     fig, ax = new(); note = ""; title = "Wannier center error (matched)"
@@ -328,7 +270,7 @@ def _figures(out_dir, data):
         title += f"  (MAE {d.mean():.4f} Å)"
         note = _beyond(int((d > top).sum()), f"{top:.3g} Å")
     _style(ax, title, "distance to true center (Å)" + note, "centers")
-    save(fig, PLOTS[2])
+    save(fig, PLOTS[0])
 
     # radius parity on matched pairs
     fig, ax = new()
@@ -340,7 +282,7 @@ def _figures(out_dir, data):
         _cbar(fig, hb, ax, "centers per cell")
     _style(ax, "Wannier radius: predicted vs true (matched)", "true radius (Å)",
            "predicted radius (Å)")
-    save(fig, PLOTS[3])
+    save(fig, PLOTS[1])
 
     # per-molecule mean center error (both spins)
     fig, ax = new(); note = ""; title = "Per-molecule mean center error"
@@ -357,7 +299,7 @@ def _figures(out_dir, data):
         title += f"  (median {np.median(per_mol):.4f} Å)"
         note = _beyond(int((per_mol > top).sum()), f"{top:.3g} Å")
     _style(ax, title, "mean distance (Å)" + note, "molecules")
-    save(fig, PLOTS[4])
+    save(fig, PLOTS[2])
 
 
 # ------------------------------------------------------------------ one-call evaluation
@@ -405,13 +347,10 @@ def evaluate_checkpoint(cfg, params_path, out_dir, *, examples=None, dataset_pat
                          "Use the config the model was trained with.")
 
     preds = predict_all(model, params, examples, batch_size, nms_radius(cfg))
-    ref = params["params"].get("atom_ref", {}).get("embedding")
-    atom_ref = None if ref is None else np.asarray(ref)[:, 0]
-    mol_rows, center_rows, summary, data = build_report(examples, preds, names, spins, atom_ref)
-    de, dc = rotation_drift(model, params, examples[0], nms_radius(cfg))
+    mol_rows, center_rows, summary, data = build_report(examples, preds, names, spins)
+    dc = rotation_drift(model, params, examples[0], nms_radius(cfg))
     text = format_summary(summary, [f"Accuracy report — model {params_path}"] + header) + (
-        f"\n\nSYMMETRY spot-check (random rotation, one molecule): energy drift {de:.2e} eV, "
-        f"center drift {dc:.2e} A")
+        f"\n\nSYMMETRY spot-check (random rotation, one molecule): center drift {dc:.2e} A")
     if skipped:
         text += "\n\nSKIPPED (first 20):\n" + "\n".join(f"  {m}: {why}" for m, why in skipped[:20])
     write_outputs(out_dir, mol_rows, center_rows, text, data, spins)

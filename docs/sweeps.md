@@ -105,17 +105,17 @@ The sweep file is self-contained: its `base:` is the full run config written inl
 `configs/gpu.yaml`), so nothing outside it is read. (`base:` may also be a path to a config file.)
 Every override must name a key that exists in the base; a base written before a key was added
 fails at start-up with `no such config key`. A run with `promote: false` is never promoted to
-stage 2 (used for diagnostics whose objective isn't comparable, like energy only).
+stage 2 (used for diagnostics whose objective isn't comparable with the others).
 
-**Current plan: `wannier_v4`** (training recipe aimed at energy and the center mean/median; the
-sources are in [refs](refs.md)). The base turns on L1 losses (normalized energy, distance for
-centers), NMS selection with NMS-consistent targets, and a weight EMA (0.99). Each run switches
-one of them off or tries one EGNN QM9 setting:
+**Current plan: `wannier_v4`** (**Wannier only** — the energy target was removed, CLAUDE.md §1 —
+with a recipe aimed at the center mean/median; sources in [refs](refs.md)). The base turns on the
+L1 distance loss, NMS selection with NMS-consistent targets, and a weight EMA (0.99). Each run
+switches one of them off or tries one EGNN QM9 setting. If `runs/wannier_v4/` exists from the
+earlier energy + Wannier version of this plan, delete it before launching:
 
 | Runs | What changes | Question it answers |
 |---|---|---|
 | `base_s0`, `base_s1` | seed 0 / 1 | Run-to-run spread |
-| `energy_mse` | `loss.energy_loss: mse` (v3's) | Does L1 on normalized energy help? |
 | `pos_mse` | `wannier.position_loss: mse` (v3's) | Does the distance loss sharpen the median? |
 | `nms0` | `wannier.nms_radius: 0` (v3's) | Value of NMS selection + targets |
 | `ema0`, `ema0.999` | `train.ema_decay` 0 / 0.999 | Does weight averaging help, and how long? |
@@ -123,10 +123,9 @@ one of them off or tries one EGNN QM9 setting:
 | `batch96` | `train.batch_size: 96` | EGNN's batch size (≈ 2.7× more steps per epoch) |
 | `coords_fixed` | `model.update_coords: false` | EGNN's QM9 setting (no coordinate updates) |
 | `edge_gate` | `model.edge_gate: true` | EGNN's edge attention |
-| `energy_only` | `loss.lambda_wannier: 0`, `promote: false` | How much does sharing the network with Wannier cost the energy? If it is far better, give energy its own model or more weight |
 
-**Previous plan: `wannier_v3`** (per-atom candidate head; `final` reached test energy 0.075 eV,
-centers 0.127 Å (median 0.056 Å), radius 0.011 Å):
+**Previous plan: `wannier_v3`** (energy + Wannier, per-atom candidate head; `final` reached test
+energy 0.075 eV, centers 0.127 Å (median 0.056 Å), radius 0.011 Å):
 
 | Runs | What changes | Question it answers |
 |---|---|---|
@@ -181,17 +180,18 @@ Prerequisite on the login node: `uv sync --group gpu --group eval`.
 ## 9. Reading `status`
 
 ```
-sweep 'wannier_v2' (runs/wannier_v2)
-run             state        epoch   val obj    val E  val ctr  val rad   test E test ctr  job
-base_s1 *       finished   185/300    0.3120   0.1410   0.1902   0.0398   0.1432   0.1931  4711
+sweep 'wannier_v4' (runs/wannier_v4)
+run             state        epoch   val obj  val ctr  val rad test ctr test med test rad  job
+base_s1 *       finished   185/300    0.2902   0.1102   0.0105   0.1131   0.0522   0.0107  4711
 ...
 final           running    212/1000   0.2801   ...                                         4720
 ```
 - Sorted by **val obj** (lower = better). `*` marks the best finished stage-1 run, the one promoted
   to `final`.
 - `epoch` is current / planned; a finished run with fewer epochs than planned stopped early.
-- `val E`, `val ctr`, `val rad`: validation energy error (eV), center error (Å, mean of the spins),
-  radius error (Å) at the best epoch. `test …`: the same on the test split, from the run's report.
+- `val ctr`, `val rad`: validation center error (Å, mean of the spins) and radius error (Å) at
+  the best epoch. `test ctr`, `test med`, `test rad`: test center MAE, median and radius MAE, from
+  the run's report (`result.json` also has the RMSE and the share of centers > 1 Å off).
 - Compare a variant's `val obj` with the spread of the three seed runs: smaller differences are
   noise.
 

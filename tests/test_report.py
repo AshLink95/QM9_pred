@@ -18,7 +18,6 @@ CFG = {
     "model": {"hidden_dim": 16, "n_layers": 2, "n_elements": 10,
               "rbf": {"enabled": True, "n_basis": 8, "cutoff": 10.0}},
     "wannier": WANNIER_CFG,
-    "loss": {"lambda_energy": 1.0, "lambda_wannier": 1.0},
     "train": {"lr": 1e-3, "batch_size": 4, "epochs": 1, "seed": 0,
               "val_frac": 0.25, "test_frac": 0.25},
 }
@@ -37,8 +36,14 @@ def test_predict_all_keeps_input_order():
     ex = _examples()
     model, params = _model_params(ex)
     preds = R.predict_all(model, params, ex, batch_size=4)
-    for e, p in zip(ex, preds):
-        assert abs(p["energy"] - float(model.apply(params, e["z"], e["pos"])["energy"])) < 1e-4
+    from data.electrons import centers_per_spin
+    from model.heads import select_centers
+    for e, p in zip(ex, preds):                  # same molecule's prediction, in input order
+        k = centers_per_spin(e["z"], 2)
+        own = select_centers(model.apply(params, e["z"], e["pos"])["wannier"], k)
+        for s in range(2):
+            np.testing.assert_allclose(np.sort(p["centers"][s][:k[s]], axis=0),
+                                       np.sort(own["centers"][s][:k[s]], axis=0), atol=1e-4)
 
 
 def test_report_outputs(tmp_path):
@@ -74,19 +79,18 @@ WOUT = """ Final State
 """
 
 
-def test_load_fresh_recursive_three_roots(tmp_path):
-    for d in ("done/sub", "out_files", "wout_files"):
+def test_load_fresh_recursive_two_roots(tmp_path):
+    for d in ("done/sub", "wout_files"):
         (tmp_path / d).mkdir(parents=True)
     for mid in ("CH_1", "CH_2"):
         (tmp_path / "done/sub" / f"{mid}.fdf").write_text(FDF)            # nested -> recursive
-        (tmp_path / "out_files" / f"{mid}.out").write_text("siesta: Total = -42.0\n")
         for s in ("up", "down"):
             (tmp_path / "wout_files" / f"{mid}.manifold.valence.{s}.wout").write_text(WOUT)
-    (tmp_path / "done" / "CH_9.fdf").write_text(FDF)                       # no .out/.wout
+    (tmp_path / "done" / "CH_9.fdf").write_text(FDF)                       # no .wout
     ex, skipped = R.load_fresh([tmp_path], ["up", "down"])
     assert [e["id"] for e in ex] == ["CH_1", "CH_2"]
-    assert skipped == [("CH_9", "no .out")]
-    assert ex[0]["energy"] == -42.0 and len(ex[0]["wannier"][0]["radii"]) == 1
+    assert skipped == [("CH_9", "missing spin .wout")]
+    assert "energy" not in ex[0] and len(ex[0]["wannier"][0]["radii"]) == 1
 
 
 def test_cli_default_test_split(tmp_path, monkeypatch, capsys):

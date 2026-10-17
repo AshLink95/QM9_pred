@@ -1,13 +1,13 @@
 """Parser tests on synthetic SIESTA/Wannier90 fixtures (CLAUDE.md §9).
 
-Real-file hand-verification is deferred until sample .fdf/.out/.wout land (see plan);
-these fixtures pin the parsing LOGIC now: species->Z map, Bohr->Ang conversion, last-Total
-selection, Final-State-only WF extraction, spread->radius.
+These fixtures pin the parsing LOGIC: species->Z map, Bohr->Ang conversion, Final-State-only
+WF extraction, spread->radius. (The SIESTA `.out` is not parsed: the model predicts only
+Wannier targets.)
 """
 
 import numpy as np
 
-from data.parse_siesta import parse_fdf, parse_energy
+from data.parse_siesta import parse_fdf
 from data.parse_wout import parse_wout
 from data.units import BOHR_TO_ANG
 
@@ -28,11 +28,6 @@ AtomicCoordinatesFormat Ang
 
 FDF_BOHR = FDF_ANG.replace("AtomicCoordinatesFormat Ang",
                            "AtomicCoordinatesFormat Bohr")
-
-OUT = """\
-siesta: Total =      -100.5
-siesta: Total =      -466.123456
-"""
 
 WOUT = """\
  some minimization log
@@ -60,10 +55,6 @@ def test_parse_fdf_ang(tmp_path):
 def test_parse_fdf_bohr_converts(tmp_path):
     z, pos = parse_fdf(_write(tmp_path, "m.fdf", FDF_BOHR))
     np.testing.assert_allclose(pos[1], np.array([0.757, 0.586, 0.0]) * BOHR_TO_ANG)
-
-
-def test_parse_energy_takes_last(tmp_path):
-    assert parse_energy(_write(tmp_path, "m.out", OUT)) == -466.123456
 
 
 def test_parse_wout_final_state_only(tmp_path):

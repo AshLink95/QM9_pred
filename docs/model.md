@@ -158,26 +158,10 @@ is why the mirror test passes exactly (CLAUDE.md §8).
 
 ## 5. `heads.py` — reading out predictions
 
-### EnergyHead (invariant scalar, size-extensive)
-```python
-per_atom = _mlp(...)(h)     # [N,1]  one number per atom from its invariant features
-return jnp.sum(per_atom)    # scalar
-```
-Invariant because `h` is invariant. **Sum, not mean**, so energy scales with molecule size the
-way a total energy physically does (add an atom → add its contribution). CLAUDE.md §5.
-
-### Per-element reference energy (in `model.py`)
-```python
-e_ref  = jnp.sum(nn.Embed(n_elements, 1, name="atom_ref")(z))   # sum_i ref[Z_i]
-energy = EnergyHead(h) + e_ref
-```
-SIESTA total energies are ~−1000 to −3000 eV. Starting from a network that outputs ~0, the MSE
-was ~1e12 and training diverged. So each element gets a scalar offset `ref[Z]`, **initialized
-from a least-squares fit** `E ≈ Σ_atoms ref[Z]` on the training set (`training/train.py:
-_fit_atom_ref`); the MLP then only learns the eV-scale residual. It's an ordinary trainable
-param (lives in the checkpoint, so inference needs nothing extra); the `atom_ref` model field
-only sets its *initial* value. Still a sum over atoms → invariant, permutation-invariant,
-size-extensive.
+The model has one head: the Wannier head below. A total-energy head (a sum of per-atom scalars
+plus a per-element reference energy) existed up to v3 and was removed, because energy and
+Wannier traded off when trained through one network (CLAUDE.md §1). Checkpoints from that time
+still load; `training/train.py:load_params` ignores their energy weights.
 
 ### WannierHead (equivariant point SET per spin, from per-atom candidates)
 
@@ -244,11 +228,12 @@ pair:    c±  = b_i ± s_i · (u_i × v_i)          # P per atom (pairs_per_atom
 
 ## 6. `model.py` — assembly
 
-`QM9Model.__call__(z, pos)` = embed `z`→`h`, set `x=pos`, run `EGNNBackbone`, then both heads;
-returns `{"energy": scalar, "wannier": {centers[S,C,3], radii[S,C], logits[S,C]}}`. `model_from_config(cfg,
-atom_ref=…, radius_init=…)` reads `configs/*.yaml` and constructs it — no magic numbers in code
-(CLAUDE.md §11). `atom_ref` and `radius_init` are only initial values, fitted from the train
-split at training start; inference loads the trained values from the checkpoint.
+`QM9Model.__call__(z, pos)` = embed `z`→`h`, set `x=pos`, run `EGNNBackbone`, then the Wannier
+head; returns `{"wannier": {centers[S,C,3], radii[S,C], logits[S,C]}}` (a dict keyed by target,
+so another head could sit beside it). `model_from_config(cfg, radius_init=…)` reads
+`configs/*.yaml` and constructs it — no magic numbers in code (CLAUDE.md §11). `radius_init` is
+only an initial value, fitted from the train split at training start; inference loads the
+trained value from the checkpoint.
 
 Two backbone options from EGNN's own QM9 setup ([refs](refs.md)), both off by default and tried
 in the v4 sweep:
@@ -266,10 +251,9 @@ in the v4 sweep:
 |---|---|---|
 | rotation test fails on centers | equivariant track polluted — `diff`/`pos` fed to `φ_e`/`h`, or `φ_x` not scalar | §2, §4 |
 | translation test fails | absolute `x` used instead of `x_i − x_j`, or a candidate not anchored at `x_i` | §2, §5 |
-| energy changes under permutation | a non-sum aggregation crept in (e.g. indexing atom 0) | §2, §5 |
+| selected set changes under permutation | a non-sum aggregation crept in (e.g. indexing atom 0) | §2, §5 |
 | mirror test fails | you added a chiral feature (triple product / signed volume), or a pair's members got different radii/logits | §4, §5 |
 | `NaN` early in training | remove the `+1e-12` in `sqrt`, or radius not passed through `softplus` | §2, §5 |
-| E-loss ~1e12, then NaN | energy offset missing — targets not referenced | §5 per-element reference |
 | W-loss explodes in one epoch | coordinate update unbounded (`tanh` / `/(d+1)` removed) | §2 |
 | predicted centers pile up / stay in the plane | a global (non per-atom) output crept back in | §5 |
 | off-plane pairs never used | pair spread zero-initialized, or whole-pair matching off | §5, [losses](losses.md) §3 |
@@ -279,7 +263,6 @@ in the v4 sweep:
 2. One `EGNNLayer` (§2): pairwise `diff`/`dist`, invariant message, `sum`-aggregate, residual `h`,
    scalar-weighted coord update. **Test equivariance now on random weights** ([symmetry](symmetry.md)).
 3. Stack into `EGNNBackbone`.
-4. `EnergyHead` (sum of per-atom scalars) → train energy-only first.
-5. `WannierHead` (per-atom singles + ± pairs per spin, radius and logit per candidate; the
+4. `WannierHead` (per-atom singles + ± pairs per spin, radius and logit per candidate; the
    count comes from `data/electrons.py`, `select_centers` picks the top k).
-6. Wire in `model.py`, drive hyperparameters from config.
+5. Wire in `model.py`, drive hyperparameters from config.
